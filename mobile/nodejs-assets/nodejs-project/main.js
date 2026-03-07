@@ -117,6 +117,55 @@ rnBridge.channel.on('message', (msg) => {
         });
         break;
 
+      case 'SCAN_DEVICES': {
+        // Browse the LAN for other StreamNode nodes (laptop, etc.)
+        try {
+          const { Bonjour } = require('bonjour-service');
+          const scanner = new Bonjour();
+          const found = [];
+
+          const browser = scanner.find({ type: 'streamnode' });
+
+          browser.on('up', (svc) => {
+            const ip =
+              (svc.addresses && svc.addresses[0]) ||
+              (svc.referer && svc.referer.address) ||
+              svc.host ||
+              null;
+
+            if (!ip) return;
+
+            // Skip ourselves
+            if (ip === getLocalIP()) return;
+
+            found.push({
+              name: svc.name,
+              host: ip,
+              port: svc.port,
+              url:  `http://${ip}:${svc.port}`,
+              txt:  svc.txt || {},
+            });
+          });
+
+          // Scan for 4 seconds then return results
+          setTimeout(() => {
+            browser.stop();
+            scanner.destroy();
+            rnBridge.channel.send(JSON.stringify({
+              type:    'SCAN_RESULT',
+              devices: found,
+            }));
+          }, 4000);
+        } catch (err) {
+          rnBridge.channel.send(JSON.stringify({
+            type:    'SCAN_RESULT',
+            devices: [],
+            error:   err.message,
+          }));
+        }
+        break;
+      }
+
       default:
         console.warn('[bridge] Unknown command:', cmd.type);
     }

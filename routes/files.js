@@ -26,6 +26,7 @@ router.get("/", (req, res) => {
 
       return {
         name: file,
+        path: fullPath,
         size: stats.size,
         isDirectory: stats.isDirectory(),
         mtime: stats.mtime,
