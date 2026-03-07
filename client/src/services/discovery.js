@@ -2,7 +2,7 @@
 // and keeps the list fresh every POLL_INTERVAL ms.
 
 const POLL_INTERVAL = 5000;
-const LOCAL_URL = "http://localhost:8000";
+const LOCAL_URL = `http://${window.location.hostname}:8000`; // ✅ auto resolves
 
 export async function fetchDiscoveredDevices() {
   try {
