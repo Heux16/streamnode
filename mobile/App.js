@@ -11,6 +11,7 @@ import {
   ScrollView,
   View,
   Text,
+  Image,
   TouchableOpacity,
   FlatList,
   PermissionsAndroid,
@@ -22,8 +23,10 @@ import {
   Linking,
   BackHandler,
   TextInput,
+  Dimensions,
 } from 'react-native';
 import nodejs from 'nodejs-mobile-react-native';
+import Video from 'react-native-video';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -276,6 +279,7 @@ function BrowseTab() {
   const [loadingFiles, setLoadingFiles]     = useState(false);
   const [fileError, setFileError]           = useState(null);
   const [search, setSearch]                 = useState('');
+  const [mediaScreen, setMediaScreen]       = useState(null); // {type,file,url}
 
   // Listen for SCAN_RESULT from Node.js
   useEffect(() => {
@@ -294,6 +298,7 @@ function BrowseTab() {
   // Android back button
   useEffect(() => {
     const handler = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (mediaScreen) { setMediaScreen(null); return true; }
       if (pathStack.length > 1) {
         setPathStack(s => s.slice(0, -1));
         setSearch('');
@@ -308,7 +313,7 @@ function BrowseTab() {
       return false;
     });
     return () => handler.remove();
-  }, [pathStack, selectedDevice]);
+  }, [pathStack, selectedDevice, mediaScreen]);
 
   const scan = useCallback(() => {
     setScanning(true);
@@ -358,29 +363,33 @@ function BrowseTab() {
     }
   }, [pathStack]);
 
-  const playFile = useCallback((file) => {
+  const openFile = useCallback((file) => {
     const currentFrame = pathStack[pathStack.length - 1];
     const folderPath = currentFrame ? currentFrame.path : null;
-    const streamUrl = buildStreamUrl(selectedDevice, file, folderPath);
-
-    Alert.alert(
-      'Play: ' + file.name,
-      'Open in external player?\n\n' + streamUrl,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: '▶ Open Player',
-          onPress: () => Linking.openURL(streamUrl).catch(() =>
-            Alert.alert('Error', 'No app found to play this file. Install VLC.'),
-          ),
-        },
-        {
-          text: '🌐 Browser',
-          onPress: () => Linking.openURL(streamUrl),
-        },
-      ],
-    );
+    const url = buildStreamUrl(selectedDevice, file, folderPath);
+    if (file.type === 'video') {
+      setMediaScreen({ type: 'video', file, url });
+    } else if (file.type === 'audio') {
+      setMediaScreen({ type: 'audio', file, url });
+    } else if (file.type === 'image') {
+      setMediaScreen({ type: 'image', file, url });
+    } else {
+      // CSV, DOC, PDF, TEXT, unknown → external app / browser
+      Linking.openURL(url).catch(() =>
+        Alert.alert('No app found', 'No app is registered to open this file type.'),
+      );
+    }
   }, [selectedDevice, pathStack]);
+
+  // ── Media screens ────────────────────────────────────────────────────────────
+  if (mediaScreen) {
+    if (mediaScreen.type === 'video')
+      return <VideoPlayerScreen url={mediaScreen.url} name={mediaScreen.file.name} onClose={() => setMediaScreen(null)} />;
+    if (mediaScreen.type === 'audio')
+      return <AudioPlayerScreen url={mediaScreen.url} name={mediaScreen.file.name} onClose={() => setMediaScreen(null)} />;
+    if (mediaScreen.type === 'image')
+      return <ImageViewerScreen url={mediaScreen.url} name={mediaScreen.file.name} onClose={() => setMediaScreen(null)} />;
+  }
 
   // ── Device list ─────────────────────────────────────────────────────────────
   if (!selectedDevice) {
@@ -491,8 +500,8 @@ function BrowseTab() {
               onPress={() => {
                 if (file.isDirectory) {
                   openFolder(file.path || (currentPath ? currentPath + '/' + file.name : file.name));
-                } else if (file.type === 'video' || file.type === 'audio' || file.type === 'image') {
-                  playFile(file);
+                } else {
+                  openFile(file);
                 }
               }}
             >
@@ -512,6 +521,210 @@ function BrowseTab() {
           }
         />
       )}
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Media screens
+// ─────────────────────────────────────────────────────────────────────────────
+
+function formatTime(secs) {
+  if (!secs || secs < 0) return '0:00';
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function SeekBar({ progress, duration, onSeek }) {
+  const [barWidth, setBarWidth] = useState(1);
+  const filled = duration > 0 ? Math.min(1, progress / duration) : 0;
+  return (
+    <TouchableOpacity
+      activeOpacity={1}
+      onPress={e => onSeek(e.nativeEvent.locationX / barWidth)}
+      onLayout={e => setBarWidth(e.nativeEvent.layout.width || 1)}
+      style={pStyles.seekOuter}
+    >
+      <View style={[pStyles.seekFill, { flex: filled || 0.0001 }]} />
+      <View style={[pStyles.seekEmpty, { flex: Math.max(0.0001, 1 - filled) }]} />
+    </TouchableOpacity>
+  );
+}
+
+function VideoPlayerScreen({ url, name, onClose }) {
+  const [paused, setPaused] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [showControls, setShowControls] = useState(true);
+  const [buffering, setBuffering] = useState(true);
+  const videoRef = useRef(null);
+  const hideTimer = useRef(null);
+
+  const scheduleHide = useCallback(() => {
+    clearTimeout(hideTimer.current);
+    hideTimer.current = setTimeout(() => setShowControls(false), 3500);
+  }, []);
+
+  useEffect(() => { scheduleHide(); return () => clearTimeout(hideTimer.current); }, []);
+
+  const toggleControls = () => {
+    setShowControls(s => { if (!s) scheduleHide(); return !s; });
+  };
+  const togglePlay = () => { setPaused(s => !s); scheduleHide(); };
+  const seekTo = (fraction) => {
+    if (videoRef.current && duration > 0) videoRef.current.seek(fraction * duration);
+    scheduleHide();
+  };
+  const skip = (secs) => {
+    if (videoRef.current) videoRef.current.seek(Math.max(0, Math.min(duration, progress + secs)));
+    scheduleHide();
+  };
+
+  return (
+    <View style={pStyles.videoContainer}>
+      <StatusBar hidden />
+      <TouchableOpacity style={StyleSheet.absoluteFill} onPress={toggleControls} activeOpacity={1}>
+        <Video
+          ref={videoRef}
+          source={{ uri: url }}
+          style={StyleSheet.absoluteFill}
+          resizeMode="contain"
+          paused={paused}
+          onProgress={({ currentTime, seekableDuration }) => {
+            setProgress(currentTime);
+            if (seekableDuration > 0) setDuration(seekableDuration);
+          }}
+          onLoad={({ duration: d }) => { setDuration(d); setBuffering(false); }}
+          onBuffer={({ isBuffering }) => setBuffering(isBuffering)}
+          onEnd={() => setPaused(true)}
+          progressUpdateInterval={500}
+        />
+      </TouchableOpacity>
+
+      {buffering && (
+        <View style={pStyles.bufferOverlay} pointerEvents="none">
+          <ActivityIndicator size="large" color="#38bdf8" />
+        </View>
+      )}
+
+      {showControls && (
+        <View style={pStyles.videoControls} pointerEvents="box-none">
+          <View style={pStyles.topBar}>
+            <TouchableOpacity onPress={onClose} style={pStyles.closeBtn}>
+              <Text style={pStyles.closeTxt}>✕</Text>
+            </TouchableOpacity>
+            <Text style={pStyles.videoTitle} numberOfLines={1}>{name}</Text>
+          </View>
+          <View style={pStyles.bottomBar}>
+            <SeekBar progress={progress} duration={duration} onSeek={seekTo} />
+            <View style={pStyles.timeRow}>
+              <Text style={pStyles.timeTxt}>{formatTime(progress)}</Text>
+              <View style={pStyles.centerBtns}>
+                <TouchableOpacity onPress={() => skip(-10)}>
+                  <Text style={pStyles.skipTxt}>⏮ 10s</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={togglePlay} style={pStyles.playPauseBtn}>
+                  <Text style={pStyles.playPauseTxt}>{paused ? '▶' : '⏸'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => skip(10)}>
+                  <Text style={pStyles.skipTxt}>10s ⏭</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={pStyles.timeTxt}>{formatTime(duration)}</Text>
+            </View>
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
+function AudioPlayerScreen({ url, name, onClose }) {
+  const [paused, setPaused] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [buffering, setBuffering] = useState(true);
+  const videoRef = useRef(null);
+  const skip = (secs) => {
+    if (videoRef.current) videoRef.current.seek(Math.max(0, Math.min(duration, progress + secs)));
+  };
+
+  return (
+    <View style={pStyles.audioContainer}>
+      <Video
+        ref={videoRef}
+        source={{ uri: url }}
+        style={{ width: 0, height: 0 }}
+        audioOnly={true}
+        paused={paused}
+        onProgress={({ currentTime }) => setProgress(currentTime)}
+        onLoad={({ duration: d }) => { setDuration(d); setBuffering(false); }}
+        onBuffer={({ isBuffering }) => setBuffering(isBuffering)}
+        onEnd={() => setPaused(true)}
+        progressUpdateInterval={500}
+      />
+
+      <TouchableOpacity onPress={onClose} style={pStyles.audioCloseBtn}>
+        <Text style={pStyles.closeTxt}>✕</Text>
+      </TouchableOpacity>
+
+      <View style={pStyles.albumArt}>
+        {buffering
+          ? <ActivityIndicator size="large" color="#38bdf8" />
+          : <Text style={{ fontSize: 72 }}>🎵</Text>}
+      </View>
+
+      <Text style={pStyles.trackName} numberOfLines={2}>{name}</Text>
+
+      <SeekBar progress={progress} duration={duration}
+        onSeek={(f) => { if (videoRef.current && duration > 0) videoRef.current.seek(f * duration); }}
+      />
+
+      <View style={pStyles.audioTimeRow}>
+        <Text style={pStyles.timeTxt}>{formatTime(progress)}</Text>
+        <Text style={pStyles.timeTxt}>{formatTime(duration)}</Text>
+      </View>
+
+      <View style={pStyles.audioBtns}>
+        <TouchableOpacity onPress={() => skip(-10)}>
+          <Text style={pStyles.skipTxt}>⏮ 10s</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => setPaused(s => !s)} style={pStyles.audioPlayBtn}>
+          <Text style={pStyles.audioPlayTxt}>{paused ? '▶' : '⏸'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => skip(10)}>
+          <Text style={pStyles.skipTxt}>10s ⏭</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+function ImageViewerScreen({ url, name, onClose }) {
+  const { width, height } = Dimensions.get('window');
+  return (
+    <View style={{ flex: 1, backgroundColor: '#000' }}>
+      <StatusBar hidden />
+      <TouchableOpacity onPress={onClose} style={pStyles.closeBtn}>
+        <Text style={pStyles.closeTxt}>✕</Text>
+      </TouchableOpacity>
+      <Text style={pStyles.imgTitle} numberOfLines={1}>{name}</Text>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}
+        maximumZoomScale={5}
+        minimumZoomScale={1}
+        centerContent={true}
+        showsHorizontalScrollIndicator={false}
+        showsVerticalScrollIndicator={false}
+      >
+        <Image
+          source={{ uri: url }}
+          style={{ width, height: height - 56 }}
+          resizeMode="contain"
+        />
+      </ScrollView>
     </View>
   );
 }
@@ -682,4 +895,100 @@ const styles = StyleSheet.create({
   emptyTitle: { color: C.text, fontSize: 17, fontWeight: '600', marginBottom: 8 },
   emptyDesc:  { color: C.muted, fontSize: 13, textAlign: 'center', lineHeight: 20 },
   errorText:  { color: '#ef4444', fontSize: 14, textAlign: 'center' },
+});
+
+// ── Player / viewer styles ────────────────────────────────────────────────────
+const pStyles = StyleSheet.create({
+  // Video
+  videoContainer: { flex: 1, backgroundColor: '#000' },
+  videoControls: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'space-between',
+  },
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingTop: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  closeBtn: { padding: 8 },
+  closeTxt: { color: '#fff', fontSize: 20, fontWeight: '700' },
+  videoTitle: { flex: 1, color: '#fff', fontSize: 14, fontWeight: '600', marginLeft: 8 },
+  bottomBar: {
+    paddingBottom: 16,
+    paddingHorizontal: 14,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  seekOuter: {
+    flexDirection: 'row',
+    height: 28,
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  seekFill:  { height: 4, backgroundColor: '#38bdf8', borderRadius: 2 },
+  seekEmpty: { height: 4, backgroundColor: '#475569', borderRadius: 2 },
+  timeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  timeTxt: { color: '#cbd5e1', fontSize: 12, minWidth: 36 },
+  centerBtns: { flexDirection: 'row', alignItems: 'center', gap: 18 },
+  skipTxt: { color: '#94a3b8', fontSize: 13 },
+  playPauseBtn: {
+    width: 46, height: 46, borderRadius: 23,
+    backgroundColor: '#0ea5e9',
+    justifyContent: 'center', alignItems: 'center',
+  },
+  playPauseTxt: { color: '#fff', fontSize: 18 },
+  bufferOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center', alignItems: 'center',
+  },
+  // Audio
+  audioContainer: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  audioCloseBtn: { position: 'absolute', top: 16, left: 16, padding: 8 },
+  albumArt: {
+    width: 180, height: 180, borderRadius: 90,
+    backgroundColor: '#1e293b',
+    justifyContent: 'center', alignItems: 'center',
+    marginBottom: 28,
+    borderWidth: 2, borderColor: '#334155',
+  },
+  trackName: {
+    color: '#f1f5f9', fontSize: 18, fontWeight: '700',
+    textAlign: 'center', marginBottom: 24, lineHeight: 26,
+  },
+  audioTimeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    width: '100%',
+    marginTop: 4,
+    marginBottom: 20,
+  },
+  audioBtns: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 24,
+    marginTop: 4,
+  },
+  audioPlayBtn: {
+    width: 60, height: 60, borderRadius: 30,
+    backgroundColor: '#0ea5e9',
+    justifyContent: 'center', alignItems: 'center',
+  },
+  audioPlayTxt: { color: '#fff', fontSize: 22 },
+  // Image viewer
+  imgTitle: {
+    position: 'absolute', top: 14, left: 52, right: 12, zIndex: 10,
+    color: '#fff', fontSize: 14, fontWeight: '600',
+  },
 });
