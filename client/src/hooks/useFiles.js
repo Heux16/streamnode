@@ -7,7 +7,8 @@ export function useFiles(folderPath) {
   const [error, setError] = useState(null);
 
   const fetchFiles = useCallback(async () => {
-    if (!folderPath) return;
+    // null = use server default (valid); undefined = no device selected (skip)
+    if (folderPath === undefined) return;
     setLoading(true);
     setError(null);
     try {

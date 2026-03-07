@@ -43,13 +43,25 @@ export default function FileItem({ file, currentPath }) {
   const color = TYPE_COLORS[file.type] ?? "text-gray-400";
 
   function handleClick() {
-    const fullPath = `${currentPath}/${file.name}`;
+    // Prefer the absolute path returned by the server (mobile returns file.path).
+    // Fall back to constructing from currentPath for the laptop server.
+    const fullPath =
+      file.path ??
+      (currentPath != null ? `${currentPath}/${file.name}` : file.name);
+
+    // Derive the parent directory for streaming:
+    // - if file.path is absolute (starts with /), take dirname
+    // - otherwise use currentPath
+    const folderPath =
+      file.path
+        ? file.path.substring(0, file.path.lastIndexOf("/")) || "/"
+        : currentPath;
 
     if (file.isDirectory) {
       setCurrentPath(fullPath);
     } else if (["video", "audio", "image"].includes(file.type)) {
       navigate("/player", {
-        state: { file, folderPath: currentPath },
+        state: { file, folderPath },
       });
     }
   }

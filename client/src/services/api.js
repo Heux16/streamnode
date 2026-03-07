@@ -20,10 +20,10 @@ export async function getDeviceInfo() {
 }
 
 // GET /files?path=
-export async function getFiles(folderPath = "./shared") {
-  const { data } = await client.get("/files", {
-    params: { path: folderPath },
-  });
+// folderPath=null → omit param, server uses its own default shared folder
+export async function getFiles(folderPath) {
+  const params = folderPath != null ? { path: folderPath } : {};
+  const { data } = await client.get("/files", { params });
   return data;
 }
 

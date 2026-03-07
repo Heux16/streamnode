@@ -5,19 +5,21 @@ const DeviceContext = createContext(null);
 
 export function DeviceProvider({ children }) {
   const [selectedDevice, setSelectedDevice] = useState(null);
-  const [currentPath, setCurrentPath] = useState("./shared");
+  const [currentPath, setCurrentPath] = useState(undefined);
   const [fileList, setFileList] = useState([]);
 
   const selectDevice = useCallback((device) => {
     setSelectedDevice(device);
     setBaseURL(device.url);
-    setCurrentPath("./shared");
+    // null means "use server default" — the laptop serves ./shared,
+    // the phone serves /storage/emulated/0/Movies, each picks its own default.
+    setCurrentPath(null);
     setFileList([]);
   }, []);
 
   const clearDevice = useCallback(() => {
     setSelectedDevice(null);
-    setCurrentPath("./shared");
+    setCurrentPath(undefined);
     setFileList([]);
   }, []);
 

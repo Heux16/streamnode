@@ -3,14 +3,28 @@ import { useDevice } from "../context/DeviceContext.jsx";
 export default function Breadcrumb() {
   const { currentPath, setCurrentPath } = useDevice();
 
-  // Split path into segments  "./shared/movies/Marvel" → ["shared", "movies", "Marvel"]
+  if (!currentPath) {
+    return (
+      <nav className="flex items-center gap-1 text-sm">
+        <span className="text-gray-400">Root</span>
+      </nav>
+    );
+  }
+
+  const isAbsolute = currentPath.startsWith("/");
+
+  // "./shared/movies/Marvel" → ["shared", "movies", "Marvel"]
+  // "/storage/emulated/0/Movies" → ["storage", "emulated", "0", "Movies"]
   const parts = currentPath
     .replace(/^\.\//, "")
     .split("/")
     .filter(Boolean);
 
   function navigateTo(index) {
-    const newPath = "./" + parts.slice(0, index + 1).join("/");
+    const segments = parts.slice(0, index + 1);
+    const newPath = isAbsolute
+      ? "/" + segments.join("/")
+      : "./" + segments.join("/");
     setCurrentPath(newPath);
   }
 
