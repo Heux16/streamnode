@@ -42,6 +42,12 @@ export function stopAdvertise() {
   service.stop();
   service = null;
 
+  // Send DNS-SD goodbye packets so LAN peers immediately drop this entry.
+  // Use a callback so the socket isn't torn down before goodbye packets fly.
+  bonjour.unpublishAll(() => {
+    // noop - just ensures the callback fires after goodbyes are sent
+  });
+
   return {
     advertising: false,
     alreadyStopped: false

@@ -14,7 +14,7 @@ const SORT_OPTIONS = [
 
 export default function FileExplorer() {
   const navigate = useNavigate();
-  const { selectedDevice, currentPath } = useDevice();
+  const { selectedDevice, currentPath, clearDevice } = useDevice();
   const { files, loading, error, refresh } = useFiles(currentPath);
 
   const [search, setSearch] = useState("");
@@ -131,7 +131,19 @@ export default function FileExplorer() {
         </div>
 
         {/* Error */}
-        {error && (
+        {error === "UNAUTHORIZED" && (
+          <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-5 mb-4 text-center">
+            <p className="text-yellow-400 font-semibold mb-1">🔒 Session Expired</p>
+            <p className="text-gray-400 text-sm mb-4">Your pairing token has expired. Go back and pair again.</p>
+            <button
+              onClick={() => { clearDevice(); navigate("/"); }}
+              className="px-4 py-2 bg-brand hover:bg-brand-dark rounded-xl text-sm font-medium transition"
+            >
+              ← Back to Devices
+            </button>
+          </div>
+        )}
+        {error && error !== "UNAUTHORIZED" && (
           <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-4 text-red-400 text-sm">
             ⚠️ {error}
           </div>

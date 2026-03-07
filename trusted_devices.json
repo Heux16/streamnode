@@ -1,0 +1,12 @@
+[
+  {
+    "deviceName": "Browser-localhost",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkZXZpY2VOYW1lIjoiQnJvd3Nlci1sb2NhbGhvc3QiLCJwYWlyZWRBdCI6MTc3Mjg5MzI4MiwiaWF0IjoxNzcyODkzMjgyLCJleHAiOjE3NzM0OTgwODJ9.VnKPPK0wuxLJY5zAyC1pkbDakfkiU7Ye_GhRQMcs9KE",
+    "pairedAt": 1772893282
+  },
+  {
+    "deviceName": "Phone",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkZXZpY2VOYW1lIjoiUGhvbmUiLCJwYWlyZWRBdCI6MTc3Mjg5NjAxOCwiaWF0IjoxNzcyODk2MDE4LCJleHAiOjE3NzM1MDA4MTh9.J2EcftQVU3eSY11c6CuBlb5TGeB4CloFC4dGuV3faQY",
+    "pairedAt": 1772896018
+  }
+]

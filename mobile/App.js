@@ -24,9 +24,15 @@ import {
   BackHandler,
   TextInput,
   Dimensions,
+  Animated,
+  PanResponder,
 } from 'react-native';
 import nodejs from 'nodejs-mobile-react-native';
 import Video from 'react-native-video';
+
+// Per-session token registry  { [deviceUrl]: jwtToken }
+// Survives re-renders; cleared on app restart (acceptable for LAN use).
+const tokenStore = {};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -83,18 +89,22 @@ function formatSize(bytes) {
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
-function buildStreamUrl(device, file, folderPath) {
-  const dir = folderPath != null ? encodeURIComponent(folderPath) : '';
+function buildStreamUrl(device, file, folderPath, token) {
+  const parts = [];
+  if (folderPath != null) parts.push('path=' + encodeURIComponent(folderPath));
+  if (token)              parts.push('token=' + encodeURIComponent(token));
   const name = encodeURIComponent(file.name);
-  return device.url + '/stream/' + name + (dir ? '?path=' + dir : '');
+  return device.url + '/stream/' + name + (parts.length ? '?' + parts.join('&') : '');
 }
 
-async function fetchFiles(deviceUrl, path) {
+async function fetchFiles(deviceUrl, path, token) {
   const url = path != null
     ? deviceUrl + '/files?path=' + encodeURIComponent(path)
     : deviceUrl + '/files';
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const headers = token ? { Authorization: 'Bearer ' + token } : {};
+  const res = await fetch(url, { headers });
+  if (res.status === 401) throw new Error('UNAUTHORIZED');
+  if (!res.ok)            throw new Error('HTTP ' + res.status);
   return res.json();
 }
 
@@ -111,6 +121,8 @@ export default function App() {
   const [errorMsg, setErrorMsg]           = useState('');
   const [permissionsOk, setPermissionsOk] = useState(false);
   const [nodeStarted, setNodeStarted]     = useState(false);
+  const [incomingPairCode, setIncomingPairCode] = useState(null); // code shown when a device pairs to THIS phone
+  const [trustedDevices, setTrustedDevices]     = useState([]); // devices that have paired with this phone
 
   // Start Node.js once
   useEffect(() => {
@@ -138,6 +150,15 @@ export default function App() {
         } else if (data.type === 'ADVERTISE_ON_ACK')  setAdvertising(true);
         else if (data.type === 'ADVERTISE_OFF_ACK') setAdvertising(false);
         else if (data.type === 'SERVER_STOPPED')    setServerStatus(STATUS.STOPPED);
+        else if (data.type === 'PAIR_CODE_REQUESTED') setIncomingPairCode(data.code);
+        else if (data.type === 'DEVICE_PAIRED') {
+          setIncomingPairCode(null);
+          nodejs.channel.send(JSON.stringify({ type: 'GET_TRUSTED_DEVICES' }));
+        }
+        else if (data.type === 'TRUSTED_DEVICES') setTrustedDevices(data.devices || []);
+        else if (data.type === 'DEVICE_REVOKED') {
+          setTrustedDevices(prev => prev.filter(d => d.deviceName !== data.name));
+        }
       } catch (_) {}
     });
     return () => listener.remove();
@@ -151,9 +172,11 @@ export default function App() {
     });
   }, []);
 
-  // Poll status
+  // Poll status + fetch trusted devices on start
   useEffect(() => {
     if (!nodeStarted) return;
+    // fetch trusted devices once on startup
+    nodejs.channel.send(JSON.stringify({ type: 'GET_TRUSTED_DEVICES' }));
     const id = setInterval(() => {
       nodejs.channel.send(JSON.stringify({ type: 'GET_STATUS' }));
     }, 10000);
@@ -172,6 +195,12 @@ export default function App() {
             advertising={advertising}
             permissionsOk={permissionsOk}
             errorMsg={errorMsg}
+            incomingPairCode={incomingPairCode}
+            onClearPairCode={() => setIncomingPairCode(null)}
+            trustedDevices={trustedDevices}
+            onRevokeDevice={(name) => {
+              nodejs.channel.send(JSON.stringify({ type: 'REVOKE_DEVICE', name }));
+            }}
           />
         : <BrowseTab />
       }
@@ -205,7 +234,7 @@ export default function App() {
 // Tab 1 – Server Status
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ServerTab({ status, ip, port, advertising, permissionsOk, errorMsg }) {
+function ServerTab({ status, ip, port, advertising, permissionsOk, errorMsg, incomingPairCode, onClearPairCode, trustedDevices, onRevokeDevice }) {
   const statusColor =
     status === STATUS.RUNNING ? '#22c55e' :
     status === STATUS.ERROR   ? '#ef4444' :
@@ -256,6 +285,50 @@ function ServerTab({ status, ip, port, advertising, permissionsOk, errorMsg }) {
         />
       </Card>
 
+      {incomingPairCode && (
+        <View style={styles.pairNotifCard}>
+          <Text style={styles.pairNotifTitle}>📲  Incoming Pair Request</Text>
+          <Text style={styles.pairNotifSub}>Show this code to confirm access:</Text>
+          <View style={styles.pairCodeRow}>
+            {incomingPairCode.split('').map((d, i) => (
+              <View key={i} style={styles.pairCodeDigit}>
+                <Text style={styles.pairCodeDigitTxt}>{d}</Text>
+              </View>
+            ))}
+          </View>
+          <TouchableOpacity onPress={onClearPairCode} style={styles.pairDismissBtn}>
+            <Text style={styles.pairDismissTxt}>Dismiss</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Trusted Devices */}
+      <Card label={`Trusted Devices (${trustedDevices.length})`}>
+        {trustedDevices.length === 0 ? (
+          <Text style={{ color: '#64748b', fontSize: 13 }}>No devices have paired yet.</Text>
+        ) : (
+          trustedDevices.map((d) => (
+            <View key={d.deviceName} style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#1e293b' }}>
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: '#f1f5f9', fontSize: 13, fontWeight: '600' }}>{d.deviceName}</Text>
+                <Text style={{ color: '#64748b', fontSize: 11 }}>Paired {d.pairedAt}</Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => {
+                  Alert.alert('Revoke Access', `Remove "${d.deviceName}" from trusted devices?`, [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Revoke', style: 'destructive', onPress: () => onRevokeDevice(d.deviceName) },
+                  ]);
+                }}
+                style={{ paddingHorizontal: 10, paddingVertical: 4, backgroundColor: '#ef44441a', borderRadius: 8 }}
+              >
+                <Text style={{ color: '#ef4444', fontSize: 12, fontWeight: '600' }}>Revoke</Text>
+              </TouchableOpacity>
+            </View>
+          ))
+        )}
+      </Card>
+
       <TouchableOpacity
         style={[styles.btn, advertising ? styles.btnOff : styles.btnOn, { marginTop: 8 }]}
         onPress={toggleAd}
@@ -280,6 +353,7 @@ function BrowseTab() {
   const [fileError, setFileError]           = useState(null);
   const [search, setSearch]                 = useState('');
   const [mediaScreen, setMediaScreen]       = useState(null); // {type,file,url}
+  const [pairingDevice, setPairingDevice]   = useState(null); // device awaiting pairing
 
   // Listen for SCAN_RESULT from Node.js
   useEffect(() => {
@@ -298,7 +372,8 @@ function BrowseTab() {
   // Android back button
   useEffect(() => {
     const handler = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (mediaScreen) { setMediaScreen(null); return true; }
+      if (mediaScreen)   { setMediaScreen(null); return true; }
+      if (pairingDevice) { setPairingDevice(null); return true; }
       if (pathStack.length > 1) {
         setPathStack(s => s.slice(0, -1));
         setSearch('');
@@ -313,7 +388,7 @@ function BrowseTab() {
       return false;
     });
     return () => handler.remove();
-  }, [pathStack, selectedDevice, mediaScreen]);
+  }, [pathStack, selectedDevice, mediaScreen, pairingDevice]);
 
   const scan = useCallback(() => {
     setScanning(true);
@@ -322,17 +397,23 @@ function BrowseTab() {
     setTimeout(() => setScanning(false), 6000);
   }, []);
 
-  const openDevice = useCallback(async (device) => {
+  const openDevice = useCallback(async (device, token) => {
     setSelectedDevice(device);
     setPathStack([]);
     setFileError(null);
     setSearch('');
     setLoadingFiles(true);
     try {
-      const files = await fetchFiles(device.url, null);
+      const files = await fetchFiles(device.url, null, token);
       setPathStack([{ path: null, files }]);
     } catch (e) {
-      setFileError(e.message);
+      if (e.message === 'UNAUTHORIZED') {
+        delete tokenStore[device.url];
+        setSelectedDevice(null);
+        setPairingDevice(device);
+      } else {
+        setFileError(e.message);
+      }
     } finally {
       setLoadingFiles(false);
     }
@@ -342,11 +423,19 @@ function BrowseTab() {
     setLoadingFiles(true);
     setFileError(null);
     setSearch('');
+    const token = tokenStore[selectedDevice.url];
     try {
-      const files = await fetchFiles(selectedDevice.url, folderPath);
+      const files = await fetchFiles(selectedDevice.url, folderPath, token);
       setPathStack(s => [...s, { path: folderPath, files }]);
     } catch (e) {
-      setFileError(e.message);
+      if (e.message === 'UNAUTHORIZED') {
+        delete tokenStore[selectedDevice.url];
+        setSelectedDevice(null);
+        setPathStack([]);
+        setPairingDevice(selectedDevice);
+      } else {
+        setFileError(e.message);
+      }
     } finally {
       setLoadingFiles(false);
     }
@@ -366,7 +455,8 @@ function BrowseTab() {
   const openFile = useCallback((file) => {
     const currentFrame = pathStack[pathStack.length - 1];
     const folderPath = currentFrame ? currentFrame.path : null;
-    const url = buildStreamUrl(selectedDevice, file, folderPath);
+    const token = tokenStore[selectedDevice.url];
+    const url = buildStreamUrl(selectedDevice, file, folderPath, token);
     if (file.type === 'video') {
       setMediaScreen({ type: 'video', file, url });
     } else if (file.type === 'audio') {
@@ -381,7 +471,15 @@ function BrowseTab() {
     }
   }, [selectedDevice, pathStack]);
 
-  // ── Media screens ────────────────────────────────────────────────────────────
+  const handleDeviceTap = useCallback((device) => {
+    const token = tokenStore[device.url];
+    if (token) {
+      openDevice(device, token);
+    } else {
+      setPairingDevice(device);
+    }
+  }, [openDevice]);
+
   if (mediaScreen) {
     if (mediaScreen.type === 'video')
       return <VideoPlayerScreen url={mediaScreen.url} name={mediaScreen.file.name} onClose={() => setMediaScreen(null)} />;
@@ -392,6 +490,21 @@ function BrowseTab() {
   }
 
   // ── Device list ─────────────────────────────────────────────────────────────
+  // Show pairing screen if a device was tapped without a token
+  if (pairingDevice && !selectedDevice) {
+    return (
+      <PairingScreen
+        device={pairingDevice}
+        onCancel={() => setPairingDevice(null)}
+        onPaired={(dev, token) => {
+          tokenStore[dev.url] = token;
+          setPairingDevice(null);
+          openDevice(dev, token);
+        }}
+      />
+    );
+  }
+
   if (!selectedDevice) {
     return (
       <View style={styles.flex}>
@@ -426,7 +539,7 @@ function BrowseTab() {
           keyExtractor={d => d.url}
           contentContainerStyle={{ padding: 16 }}
           renderItem={({ item }) => (
-            <TouchableOpacity style={styles.deviceCard} onPress={() => openDevice(item)}>
+            <TouchableOpacity style={styles.deviceCard} onPress={() => handleDeviceTap(item)}>
               <Text style={styles.deviceIcon}>💻</Text>
               <View style={styles.flex}>
                 <Text style={styles.deviceName}>{item.name}</Text>
@@ -526,6 +639,141 @@ function BrowseTab() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pairing Screen
+// ─────────────────────────────────────────────────────────────────────────────
+
+function PairingScreen({ device, onCancel, onPaired }) {
+  const [step, setStep]   = useState('idle'); // idle | requesting | show_code | verifying | error
+  const [code, setCode]   = useState('');
+  const [errMsg, setErrMsg] = useState('');
+
+  const requestCode = async () => {
+    setStep('requesting');
+    setErrMsg('');
+    try {
+      const res  = await fetch(device.url + '/pair/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      // Server does NOT return the code — it only shows it on its own screen
+      setCode('');
+      setStep('show_code');
+    } catch (e) {
+      setErrMsg(e.message);
+      setStep('error');
+    }
+  };
+
+  const confirmPair = async () => {
+    setStep('verifying');
+    setErrMsg('');
+    try {
+      const res  = await fetch(device.url + '/pair/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pairingCode: code, deviceName: 'Phone' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Verification failed');
+      onPaired(device, data.token);
+    } catch (e) {
+      setErrMsg(e.message);
+      setStep('error');
+    }
+  };
+
+  return (
+    <View style={styles.flex}>
+      {/* Header */}
+      <View style={styles.fileBrowserHeader}>
+        <TouchableOpacity onPress={onCancel} style={styles.backBtn}>
+          <Text style={styles.backBtnText}>‹</Text>
+        </TouchableOpacity>
+        <View style={styles.flex}>
+          <Text style={styles.deviceNameSmall}>Pair with {device.name}</Text>
+          <Text style={styles.pathText}>{device.host}:{device.port}</Text>
+        </View>
+      </View>
+
+      <View style={styles.pairBody}>
+
+        {step === 'idle' && (
+          <>
+            <Text style={styles.pairIcon}>🔐</Text>
+            <Text style={styles.pairDesc}>
+              This device requires authentication.{'\n'}
+              Request a pairing code to gain access.
+            </Text>
+            <TouchableOpacity style={[styles.btn, styles.btnOn, { width: '100%' }]} onPress={requestCode}>
+              <Text style={styles.btnText}>Request Pairing Code</Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        {(step === 'requesting' || step === 'verifying') && (
+          <>
+            <ActivityIndicator size="large" color="#38bdf8" />
+            <Text style={styles.pairDesc}>
+              {step === 'requesting' ? 'Requesting code…' : 'Verifying pairing code…'}
+            </Text>
+          </>
+        )}
+
+        {step === 'show_code' && (
+          <>
+            <Text style={styles.pairDesc}>
+              A 6-digit code was generated on{' '}
+              <Text style={{ color: '#38bdf8', fontWeight: '600' }}>{device.name}</Text>.{'\n'}
+              Look it up on that device (terminal or screen){'\n'}and enter it below.
+            </Text>
+            <TextInput
+              style={{
+                fontSize: 28,
+                letterSpacing: 10,
+                textAlign: 'center',
+                borderWidth: 2,
+                borderColor: '#38bdf8',
+                borderRadius: 12,
+                paddingVertical: 10,
+                paddingHorizontal: 16,
+                width: '80%',
+                color: '#f8fafc',
+                marginBottom: 20,
+              }}
+              placeholder="------"
+              placeholderTextColor="#475569"
+              keyboardType="numeric"
+              maxLength={6}
+              value={code}
+              onChangeText={setCode}
+            />
+            <TouchableOpacity
+              style={[styles.btn, styles.btnOn, { width: '100%', opacity: code.length === 6 ? 1 : 0.4 }]}
+              onPress={confirmPair}
+              disabled={code.length !== 6}
+            >
+              <Text style={styles.btnText}>✓  Confirm Pairing</Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        {step === 'error' && (
+          <>
+            <Text style={{ fontSize: 44, marginBottom: 16 }}>⚠️</Text>
+            <Text style={styles.errorText}>{errMsg}</Text>
+            <TouchableOpacity style={[styles.btn, styles.btnOn, { width: '100%', marginTop: 20 }]} onPress={() => setStep('idle')}>
+              <Text style={styles.btnText}>Try Again</Text>
+            </TouchableOpacity>
+          </>
+        )}
+      </View>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Media screens
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -536,119 +784,247 @@ function formatTime(secs) {
   return m + ':' + (s < 10 ? '0' : '') + s;
 }
 
-function SeekBar({ progress, duration, onSeek }) {
-  const [barWidth, setBarWidth] = useState(1);
+function SeekBar({ progress, duration, onSeek, onTouchStart, onTouchEnd }) {
+  const barWidthRef = useRef(1);
+  const thumbAnim   = useRef(new Animated.Value(0)).current;
   const filled = duration > 0 ? Math.min(1, progress / duration) : 0;
+
+  useEffect(() => {
+    Animated.spring(thumbAnim, { toValue: filled, useNativeDriver: false, overshootClamping: true }).start();
+  }, [filled]);
+
+  const responder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder:  () => true,
+      onPanResponderGrant: (e) => {
+        onTouchStart && onTouchStart();
+        const f = Math.max(0, Math.min(1, e.nativeEvent.locationX / barWidthRef.current));
+        onSeek(f);
+      },
+      onPanResponderMove: (e) => {
+        const f = Math.max(0, Math.min(1, e.nativeEvent.locationX / barWidthRef.current));
+        onSeek(f);
+      },
+      onPanResponderRelease: () => { onTouchEnd && onTouchEnd(); },
+    }),
+  ).current;
+
+  const thumbPos = thumbAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0%', '100%'],
+  });
+
   return (
-    <TouchableOpacity
-      activeOpacity={1}
-      onPress={e => onSeek(e.nativeEvent.locationX / barWidth)}
-      onLayout={e => setBarWidth(e.nativeEvent.layout.width || 1)}
+    <View
       style={pStyles.seekOuter}
+      onLayout={e => { barWidthRef.current = e.nativeEvent.layout.width || 1; }}
+      {...responder.panHandlers}
     >
-      <View style={[pStyles.seekFill, { flex: filled || 0.0001 }]} />
-      <View style={[pStyles.seekEmpty, { flex: Math.max(0.0001, 1 - filled) }]} />
-    </TouchableOpacity>
+      <View style={pStyles.seekTrack}>
+        <View style={[pStyles.seekFill, { flex: filled || 0.0001 }]} />
+        <View style={[pStyles.seekEmpty, { flex: Math.max(0.0001, 1 - filled) }]} />
+      </View>
+      <Animated.View style={[pStyles.seekThumb, { left: thumbPos }]} />
+    </View>
   );
 }
 
 function VideoPlayerScreen({ url, name, onClose }) {
-  const [paused, setPaused] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [showControls, setShowControls] = useState(true);
-  const [buffering, setBuffering] = useState(true);
-  const videoRef = useRef(null);
-  const hideTimer = useRef(null);
+  const [paused, setPaused]           = useState(false);
+  const [progress, setProgress]       = useState(0);
+  const [duration, setDuration]       = useState(0);
+  const [showControls, setShowControls] = useState(false); // hidden until loaded
+  const [buffering, setBuffering]     = useState(true);
+  const [loaded, setLoaded]           = useState(false);
+  const [fullscreen, setFullscreen]   = useState(false);
+  const [seeking, setSeeking]         = useState(false);
+  const controlsAnim                  = useRef(new Animated.Value(0)).current;
+  const videoRef                      = useRef(null);
+  const hideTimer                     = useRef(null);
+  const progressRef                   = useRef(0);
+  const durationRef                   = useRef(0);
 
-  const scheduleHide = useCallback(() => {
+  // Keep refs in sync so skip() always has fresh values
+  useEffect(() => { progressRef.current = progress; }, [progress]);
+  useEffect(() => { durationRef.current = duration; }, [duration]);
+
+  const showCtrl = useCallback(() => {
     clearTimeout(hideTimer.current);
-    hideTimer.current = setTimeout(() => setShowControls(false), 3500);
+    Animated.timing(controlsAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+    setShowControls(true);
+    hideTimer.current = setTimeout(() => {
+      Animated.timing(controlsAnim, { toValue: 0, duration: 300, useNativeDriver: true }).start(() =>
+        setShowControls(false),
+      );
+    }, 3500);
+  }, [controlsAnim]);
+
+  const hideCtrl = useCallback(() => {
+    clearTimeout(hideTimer.current);
+    Animated.timing(controlsAnim, { toValue: 0, duration: 300, useNativeDriver: true }).start(() =>
+      setShowControls(false),
+    );
+  }, [controlsAnim]);
+
+  const toggleControls = useCallback(() => {
+    if (showControls) hideCtrl(); else showCtrl();
+  }, [showControls, showCtrl, hideCtrl]);
+
+  useEffect(() => () => clearTimeout(hideTimer.current), []);
+
+  const togglePlay = () => { setPaused(s => !s); showCtrl(); };
+
+  const seekTo = useCallback((fraction) => {
+    const d = durationRef.current;
+    if (videoRef.current && d > 0) {
+      videoRef.current.seek(fraction * d);
+      setProgress(fraction * d);
+    }
   }, []);
 
-  useEffect(() => { scheduleHide(); return () => clearTimeout(hideTimer.current); }, []);
-
-  const toggleControls = () => {
-    setShowControls(s => { if (!s) scheduleHide(); return !s; });
-  };
-  const togglePlay = () => { setPaused(s => !s); scheduleHide(); };
-  const seekTo = (fraction) => {
-    if (videoRef.current && duration > 0) videoRef.current.seek(fraction * duration);
-    scheduleHide();
-  };
   const skip = (secs) => {
-    if (videoRef.current) videoRef.current.seek(Math.max(0, Math.min(duration, progress + secs)));
-    scheduleHide();
+    const clamped = Math.max(0, Math.min(durationRef.current, progressRef.current + secs));
+    if (videoRef.current) videoRef.current.seek(clamped);
+    setProgress(clamped);
+    showCtrl();
+  };
+
+  const toggleFullscreen = () => {
+    if (fullscreen) {
+      videoRef.current && videoRef.current.dismissFullscreenPlayer();
+    } else {
+      videoRef.current && videoRef.current.presentFullscreenPlayer();
+    }
   };
 
   return (
     <View style={pStyles.videoContainer}>
       <StatusBar hidden />
-      <TouchableOpacity style={StyleSheet.absoluteFill} onPress={toggleControls} activeOpacity={1}>
-        <Video
-          ref={videoRef}
-          source={{ uri: url }}
-          style={StyleSheet.absoluteFill}
-          resizeMode="contain"
-          paused={paused}
-          onProgress={({ currentTime, seekableDuration }) => {
-            setProgress(currentTime);
-            if (seekableDuration > 0) setDuration(seekableDuration);
-          }}
-          onLoad={({ duration: d }) => { setDuration(d); setBuffering(false); }}
-          onBuffer={({ isBuffering }) => setBuffering(isBuffering)}
-          onEnd={() => setPaused(true)}
-          progressUpdateInterval={500}
-        />
-      </TouchableOpacity>
 
+      {/* Video — sits underneath touch overlay */}
+      <Video
+        ref={videoRef}
+        source={{ uri: url }}
+        style={StyleSheet.absoluteFill}
+        resizeMode="contain"
+        paused={paused}
+        fullscreen={fullscreen}
+        onProgress={({ currentTime, seekableDuration }) => {
+          if (!seeking) setProgress(currentTime);
+          if (seekableDuration > 0) setDuration(seekableDuration);
+        }}
+        onLoad={({ duration: d }) => {
+          setDuration(d);
+          setBuffering(false);
+          setLoaded(true);
+          showCtrl();
+        }}
+        onBuffer={({ isBuffering }) => setBuffering(isBuffering)}
+        onEnd={() => { setPaused(true); showCtrl(); }}
+        onFullscreenPlayerDidPresent={() => setFullscreen(true)}
+        onFullscreenPlayerDidDismiss={() => setFullscreen(false)}
+        progressUpdateInterval={500}
+        ignoreSilentSwitch="ignore"
+      />
+
+      {/* Transparent touch overlay — catches taps without blocking video */}
+      <TouchableOpacity
+        style={StyleSheet.absoluteFill}
+        onPress={loaded ? toggleControls : undefined}
+        activeOpacity={1}
+      />
+
+      {/* Buffering spinner */}
       {buffering && (
         <View style={pStyles.bufferOverlay} pointerEvents="none">
-          <ActivityIndicator size="large" color="#38bdf8" />
+          <View style={pStyles.bufferBadge}>
+            <ActivityIndicator size="large" color="#38bdf8" />
+            <Text style={pStyles.bufferTxt}>Buffering…</Text>
+          </View>
         </View>
       )}
 
+      {/* Controls (fade in/out) */}
       {showControls && (
-        <View style={pStyles.videoControls} pointerEvents="box-none">
+        <Animated.View style={[pStyles.videoControls, { opacity: controlsAnim }]} pointerEvents="box-none">
+          {/* Top bar */}
           <View style={pStyles.topBar}>
-            <TouchableOpacity onPress={onClose} style={pStyles.closeBtn}>
-              <Text style={pStyles.closeTxt}>✕</Text>
+            <TouchableOpacity onPress={onClose} style={pStyles.iconBtn} hitSlop={{ top:12,bottom:12,left:12,right:12 }}>
+              <Text style={pStyles.iconTxt}>✕</Text>
             </TouchableOpacity>
             <Text style={pStyles.videoTitle} numberOfLines={1}>{name}</Text>
+            <TouchableOpacity onPress={toggleFullscreen} style={pStyles.iconBtn} hitSlop={{ top:12,bottom:12,left:12,right:12 }}>
+              <Text style={pStyles.iconTxt}>{fullscreen ? '⊡' : '⛶'}</Text>
+            </TouchableOpacity>
           </View>
+
+          {/* Centre play/pause tap zone */}
+          <TouchableOpacity style={pStyles.centerZone} onPress={togglePlay} activeOpacity={0.7}>
+            <View style={[pStyles.centerPlayBtn, { opacity: loaded ? 1 : 0.4 }]}>
+              <Text style={pStyles.centerPlayTxt}>{paused ? '▶' : '⏸'}</Text>
+            </View>
+          </TouchableOpacity>
+
+          {/* Bottom bar */}
           <View style={pStyles.bottomBar}>
-            <SeekBar progress={progress} duration={duration} onSeek={seekTo} />
-            <View style={pStyles.timeRow}>
+            <View style={pStyles.timeRowTop}>
               <Text style={pStyles.timeTxt}>{formatTime(progress)}</Text>
+              <Text style={pStyles.durationTxt}>{formatTime(duration)}</Text>
+            </View>
+            <SeekBar
+              progress={progress}
+              duration={duration}
+              onSeek={seekTo}
+              onTouchStart={() => { setSeeking(true); clearTimeout(hideTimer.current); }}
+              onTouchEnd={() => { setSeeking(false); showCtrl(); }}
+            />
+            <View style={pStyles.timeRow}>
+              <TouchableOpacity onPress={() => skip(-10)} style={pStyles.skipBtn}>
+                <Text style={pStyles.skipIcon}>↺</Text>
+                <Text style={pStyles.skipLabel}>10s</Text>
+              </TouchableOpacity>
               <View style={pStyles.centerBtns}>
-                <TouchableOpacity onPress={() => skip(-10)}>
-                  <Text style={pStyles.skipTxt}>⏮ 10s</Text>
+                <TouchableOpacity onPress={() => skip(-30)} style={pStyles.ctrlBtn}>
+                  <Text style={pStyles.ctrlBtnTxt}>«</Text>
                 </TouchableOpacity>
                 <TouchableOpacity onPress={togglePlay} style={pStyles.playPauseBtn}>
                   <Text style={pStyles.playPauseTxt}>{paused ? '▶' : '⏸'}</Text>
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => skip(10)}>
-                  <Text style={pStyles.skipTxt}>10s ⏭</Text>
+                <TouchableOpacity onPress={() => skip(30)} style={pStyles.ctrlBtn}>
+                  <Text style={pStyles.ctrlBtnTxt}>»</Text>
                 </TouchableOpacity>
               </View>
-              <Text style={pStyles.timeTxt}>{formatTime(duration)}</Text>
+              <TouchableOpacity onPress={() => skip(10)} style={pStyles.skipBtn}>
+                <Text style={pStyles.skipIcon}>↻</Text>
+                <Text style={pStyles.skipLabel}>10s</Text>
+              </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </Animated.View>
       )}
     </View>
   );
 }
 
 function AudioPlayerScreen({ url, name, onClose }) {
-  const [paused, setPaused] = useState(false);
+  const [paused, setPaused]     = useState(false);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
   const [buffering, setBuffering] = useState(true);
-  const videoRef = useRef(null);
+  const videoRef   = useRef(null);
+  const durationRef = useRef(0);
+  const progressRef = useRef(0);
+  useEffect(() => { durationRef.current = duration; }, [duration]);
+  useEffect(() => { progressRef.current = progress; }, [progress]);
+
   const skip = (secs) => {
-    if (videoRef.current) videoRef.current.seek(Math.max(0, Math.min(duration, progress + secs)));
+    const clamped = Math.max(0, Math.min(durationRef.current, progressRef.current + secs));
+    if (videoRef.current) videoRef.current.seek(clamped);
+    setProgress(clamped);
   };
+
+  const pct = duration > 0 ? progress / duration : 0;
 
   return (
     <View style={pStyles.audioContainer}>
@@ -663,38 +1039,62 @@ function AudioPlayerScreen({ url, name, onClose }) {
         onBuffer={({ isBuffering }) => setBuffering(isBuffering)}
         onEnd={() => setPaused(true)}
         progressUpdateInterval={500}
+        ignoreSilentSwitch="ignore"
       />
 
-      <TouchableOpacity onPress={onClose} style={pStyles.audioCloseBtn}>
+      <TouchableOpacity onPress={onClose} style={pStyles.audioCloseBtn} hitSlop={{ top:10, bottom:10, left:10, right:10 }}>
         <Text style={pStyles.closeTxt}>✕</Text>
       </TouchableOpacity>
 
-      <View style={pStyles.albumArt}>
-        {buffering
-          ? <ActivityIndicator size="large" color="#38bdf8" />
-          : <Text style={{ fontSize: 72 }}>🎵</Text>}
+      {/* Album art disc */}
+      <View style={[pStyles.discOuter, paused ? null : pStyles.discSpin]}>
+        <View style={pStyles.discInner}>
+          {buffering
+            ? <ActivityIndicator size="large" color="#38bdf8" />
+            : <Text style={{ fontSize: 64 }}>🎵</Text>}
+        </View>
       </View>
 
+      {/* Track name */}
       <Text style={pStyles.trackName} numberOfLines={2}>{name}</Text>
 
-      <SeekBar progress={progress} duration={duration}
-        onSeek={(f) => { if (videoRef.current && duration > 0) videoRef.current.seek(f * duration); }}
-      />
-
+      {/* Time labels */}
       <View style={pStyles.audioTimeRow}>
         <Text style={pStyles.timeTxt}>{formatTime(progress)}</Text>
         <Text style={pStyles.timeTxt}>{formatTime(duration)}</Text>
       </View>
 
+      {/* Seek bar */}
+      <View style={pStyles.audioSeekWrap}>
+        <SeekBar
+          progress={progress}
+          duration={duration}
+          onSeek={(f) => {
+            const t = f * durationRef.current;
+            if (videoRef.current) videoRef.current.seek(t);
+            setProgress(t);
+          }}
+        />
+      </View>
+
+      {/* Controls */}
       <View style={pStyles.audioBtns}>
-        <TouchableOpacity onPress={() => skip(-10)}>
-          <Text style={pStyles.skipTxt}>⏮ 10s</Text>
+        <TouchableOpacity onPress={() => skip(-30)} style={pStyles.ctrlBtn}>
+          <Text style={pStyles.ctrlBtnTxt}>«</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => skip(-10)} style={pStyles.skipBtn}>
+          <Text style={pStyles.skipIcon}>↺</Text>
+          <Text style={pStyles.skipLabel}>10</Text>
         </TouchableOpacity>
         <TouchableOpacity onPress={() => setPaused(s => !s)} style={pStyles.audioPlayBtn}>
           <Text style={pStyles.audioPlayTxt}>{paused ? '▶' : '⏸'}</Text>
         </TouchableOpacity>
-        <TouchableOpacity onPress={() => skip(10)}>
-          <Text style={pStyles.skipTxt}>10s ⏭</Text>
+        <TouchableOpacity onPress={() => skip(10)} style={pStyles.skipBtn}>
+          <Text style={pStyles.skipIcon}>↻</Text>
+          <Text style={pStyles.skipLabel}>10</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => skip(30)} style={pStyles.ctrlBtn}>
+          <Text style={pStyles.ctrlBtnTxt}>»</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -706,7 +1106,7 @@ function ImageViewerScreen({ url, name, onClose }) {
   return (
     <View style={{ flex: 1, backgroundColor: '#000' }}>
       <StatusBar hidden />
-      <TouchableOpacity onPress={onClose} style={pStyles.closeBtn}>
+      <TouchableOpacity onPress={onClose} style={pStyles.imgCloseBtn} hitSlop={{ top:10,bottom:10,left:10,right:10 }}>
         <Text style={pStyles.closeTxt}>✕</Text>
       </TouchableOpacity>
       <Text style={pStyles.imgTitle} numberOfLines={1}>{name}</Text>
@@ -895,100 +1295,273 @@ const styles = StyleSheet.create({
   emptyTitle: { color: C.text, fontSize: 17, fontWeight: '600', marginBottom: 8 },
   emptyDesc:  { color: C.muted, fontSize: 13, textAlign: 'center', lineHeight: 20 },
   errorText:  { color: '#ef4444', fontSize: 14, textAlign: 'center' },
+
+  // ── Pairing screen ──────────────────────────────────────────────────────────
+  pairBody: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+    gap: 18,
+  },
+  pairIcon: { fontSize: 56 },
+  pairDesc: {
+    color: C.muted,
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  pairCodeRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginVertical: 8,
+  },
+  pairCodeDigit: {
+    width: 42, height: 56,
+    borderRadius: 10,
+    backgroundColor: C.card,
+    borderWidth: 2, borderColor: C.brand,
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: C.brand, shadowOpacity: 0.3,
+    shadowRadius: 6, elevation: 4,
+  },
+  pairCodeDigitTxt: {
+    color: C.brand,
+    fontSize: 26,
+    fontWeight: '800',
+    fontVariant: ['tabular-nums'],
+  },
+  pairNote: {
+    color: '#64748b',
+    fontSize: 12,
+    textAlign: 'center',
+    lineHeight: 18,
+    marginBottom: 4,
+  },
+
+  // ── Incoming pair notification (ServerTab) ──────────────────────────────────
+  pairNotifCard: {
+    backgroundColor: '#0c2340',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: '#0369a1',
+    alignItems: 'center',
+  },
+  pairNotifTitle: {
+    color: '#38bdf8',
+    fontWeight: '700',
+    fontSize: 15,
+    marginBottom: 4,
+  },
+  pairNotifSub: { color: C.muted, fontSize: 13, marginBottom: 12 },
+  pairDismissBtn: {
+    marginTop: 12,
+    paddingVertical: 8, paddingHorizontal: 24,
+    backgroundColor: '#1e3a5f',
+    borderRadius: 8,
+  },
+  pairDismissTxt: { color: '#94a3b8', fontSize: 13 },
 });
 
 // ── Player / viewer styles ────────────────────────────────────────────────────
 const pStyles = StyleSheet.create({
-  // Video
+
+  // ── Video player ──────────────────────────────────────────────────────────
   videoContainer: { flex: 1, backgroundColor: '#000' },
+
   videoControls: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: 'space-between',
   },
+
   topBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingTop: 12,
-    paddingHorizontal: 12,
-    backgroundColor: 'rgba(0,0,0,0.55)',
+    paddingTop: 14,
+    paddingBottom: 12,
+    paddingHorizontal: 16,
+    background: 'transparent',
+    // dark gradient from top
+    backgroundColor: 'rgba(0,0,0,0.65)',
   },
-  closeBtn: { padding: 8 },
+
+  iconBtn:  { padding: 6 },
+  iconTxt:  { color: '#fff', fontSize: 19, fontWeight: '700' },
   closeTxt: { color: '#fff', fontSize: 20, fontWeight: '700' },
-  videoTitle: { flex: 1, color: '#fff', fontSize: 14, fontWeight: '600', marginLeft: 8 },
-  bottomBar: {
-    paddingBottom: 16,
-    paddingHorizontal: 14,
-    backgroundColor: 'rgba(0,0,0,0.55)',
+  videoTitle: {
+    flex: 1,
+    color: '#e2e8f0',
+    fontSize: 14,
+    fontWeight: '600',
+    marginHorizontal: 10,
   },
-  seekOuter: {
-    flexDirection: 'row',
-    height: 28,
+
+  // Centre tap zone for play/pause
+  centerZone: {
+    flex: 1,
+    justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 6,
   },
-  seekFill:  { height: 4, backgroundColor: '#38bdf8', borderRadius: 2 },
-  seekEmpty: { height: 4, backgroundColor: '#475569', borderRadius: 2 },
+  centerPlayBtn: {
+    width: 72, height: 72, borderRadius: 36,
+    backgroundColor: 'rgba(14,165,233,0.85)',
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#000', shadowOpacity: 0.4,
+    shadowRadius: 12, elevation: 8,
+  },
+  centerPlayTxt: { color: '#fff', fontSize: 28, marginLeft: 3 },
+
+  bottomBar: {
+    paddingBottom: 20,
+    paddingTop: 8,
+    paddingHorizontal: 16,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+  },
+
+  timeRowTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 2,
+  },
+  timeTxt:    { color: '#94a3b8', fontSize: 12 },
+  durationTxt:{ color: '#64748b', fontSize: 12 },
+
+  // Seek bar
+  seekOuter: {
+    height: 36,
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  seekTrack: {
+    flexDirection: 'row',
+    height: 4,
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  seekFill:  { height: 4, backgroundColor: '#38bdf8' },
+  seekEmpty: { height: 4, backgroundColor: '#334155' },
+  seekThumb: {
+    position: 'absolute',
+    top: 10,
+    width: 16, height: 16, borderRadius: 8,
+    backgroundColor: '#38bdf8',
+    marginLeft: -8,
+    shadowColor: '#38bdf8', shadowOpacity: 0.6,
+    shadowRadius: 4, elevation: 4,
+  },
+
   timeRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    marginTop: 2,
   },
-  timeTxt: { color: '#cbd5e1', fontSize: 12, minWidth: 36 },
-  centerBtns: { flexDirection: 'row', alignItems: 'center', gap: 18 },
-  skipTxt: { color: '#94a3b8', fontSize: 13 },
+
+  centerBtns: { flexDirection: 'row', alignItems: 'center', gap: 14 },
+
+  skipBtn: { alignItems: 'center', paddingHorizontal: 8 },
+  skipIcon: { color: '#cbd5e1', fontSize: 22 },
+  skipLabel:{ color: '#64748b', fontSize: 10, marginTop: -2 },
+
+  ctrlBtn:    { padding: 8 },
+  ctrlBtnTxt: { color: '#94a3b8', fontSize: 22, fontWeight: '700' },
+
   playPauseBtn: {
-    width: 46, height: 46, borderRadius: 23,
+    width: 52, height: 52, borderRadius: 26,
     backgroundColor: '#0ea5e9',
     justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#0ea5e9', shadowOpacity: 0.5,
+    shadowRadius: 8, elevation: 6,
   },
-  playPauseTxt: { color: '#fff', fontSize: 18 },
+  playPauseTxt: { color: '#fff', fontSize: 20, marginLeft: 2 },
+
   bufferOverlay: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: 'center', alignItems: 'center',
   },
-  // Audio
+  bufferBadge: {
+    backgroundColor: 'rgba(15,23,42,0.75)',
+    borderRadius: 16,
+    padding: 20,
+    alignItems: 'center',
+    gap: 10,
+  },
+  bufferTxt: { color: '#94a3b8', fontSize: 13, marginTop: 8 },
+
+  // ── Audio player ──────────────────────────────────────────────────────────
   audioContainer: {
     flex: 1,
-    backgroundColor: '#0f172a',
+    backgroundColor: '#0a0f1e',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 28,
+    paddingHorizontal: 32,
   },
-  audioCloseBtn: { position: 'absolute', top: 16, left: 16, padding: 8 },
-  albumArt: {
-    width: 180, height: 180, borderRadius: 90,
+  audioCloseBtn: { position: 'absolute', top: 20, left: 20, padding: 8, zIndex: 10 },
+
+  // Vinyl disc
+  discOuter: {
+    width: 200, height: 200, borderRadius: 100,
     backgroundColor: '#1e293b',
     justifyContent: 'center', alignItems: 'center',
-    marginBottom: 28,
+    marginBottom: 32,
+    borderWidth: 6, borderColor: '#334155',
+    shadowColor: '#38bdf8', shadowOpacity: 0.25,
+    shadowRadius: 20, elevation: 10,
+  },
+  discSpin: {
+    // React Native doesn't have CSS animations natively;
+    // visual pulse provided via borderColor contrast
+    borderColor: '#0ea5e9',
+  },
+  discInner: {
+    width: 80, height: 80, borderRadius: 40,
+    backgroundColor: '#0f172a',
+    justifyContent: 'center', alignItems: 'center',
     borderWidth: 2, borderColor: '#334155',
   },
+
   trackName: {
-    color: '#f1f5f9', fontSize: 18, fontWeight: '700',
-    textAlign: 'center', marginBottom: 24, lineHeight: 26,
+    color: '#f1f5f9', fontSize: 17, fontWeight: '700',
+    textAlign: 'center', lineHeight: 24,
+    marginBottom: 16,
   },
+
   audioTimeRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     width: '100%',
-    marginTop: 4,
-    marginBottom: 20,
+    marginBottom: 6,
   },
+
+  audioSeekWrap: { width: '100%', marginBottom: 28 },
+
   audioBtns: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 24,
+    gap: 16,
     marginTop: 4,
   },
   audioPlayBtn: {
-    width: 60, height: 60, borderRadius: 30,
+    width: 68, height: 68, borderRadius: 34,
     backgroundColor: '#0ea5e9',
     justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#0ea5e9', shadowOpacity: 0.5,
+    shadowRadius: 12, elevation: 8,
   },
-  audioPlayTxt: { color: '#fff', fontSize: 22 },
-  // Image viewer
+  audioPlayTxt: { color: '#fff', fontSize: 26, marginLeft: 3 },
+
+  // ── Image viewer ──────────────────────────────────────────────────────────
+  imgCloseBtn: {
+    position: 'absolute', top: 16, left: 16, zIndex: 10,
+    width: 38, height: 38, borderRadius: 19,
+    backgroundColor: 'rgba(15,23,42,0.7)',
+    justifyContent: 'center', alignItems: 'center',
+  },
   imgTitle: {
-    position: 'absolute', top: 14, left: 52, right: 12, zIndex: 10,
-    color: '#fff', fontSize: 14, fontWeight: '600',
+    position: 'absolute', top: 22, left: 66, right: 12, zIndex: 10,
+    color: '#e2e8f0', fontSize: 13, fontWeight: '600',
   },
 });

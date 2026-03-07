@@ -18,7 +18,7 @@ export async function fetchDiscoveredDevices() {
     // Normalise: backend returns { devices: [...], advertising, name, port }
     // Use svc.addresses[0] (actual IP) not svc.host (.local mDNS name that may
     // not resolve on all platforms/networks).
-    const devices = (data.devices ?? []).map((svc) => {
+    const rawDevices = (data.devices ?? []).map((svc) => {
       const ip =
         svc.addresses?.[0] ??
         svc.referer?.address ??
@@ -33,12 +33,29 @@ export async function fetchDiscoveredDevices() {
         type: svc.type ?? "streamnode",
         txt: svc.txt ?? {},
         url: `http://${ip}:${port}`,
-        online: true,
+        online: false, // will be set by reachability probe below
       };
     });
 
+    // Probe each device with a 2-second HTTP timeout to verify actual reachability.
+    // mDNS records stay alive on the network for minutes after a device stops,
+    // so we can't trust discovery alone for the online status.
+    await Promise.all(
+      rawDevices.map(async (d) => {
+        try {
+          const r = await fetch(`${d.url}/device`, {
+            signal: AbortSignal.timeout(2000),
+            cache: 'no-store',
+          });
+          d.online = r.ok;
+        } catch {
+          d.online = false;
+        }
+      })
+    );
+
     return {
-      devices,
+      devices: rawDevices,
       advertising: data.advertising ?? false,
       selfName: data.name ?? null,
     };

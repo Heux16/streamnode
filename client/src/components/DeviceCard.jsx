@@ -1,5 +1,6 @@
 import { useDevice } from "../context/DeviceContext.jsx";
 import { useNavigate } from "react-router-dom";
+import { loadToken, setBaseURL } from "../services/api.js";
 
 const DEVICE_ICONS = {
   laptop: "💻",
@@ -19,12 +20,20 @@ function deviceIcon(name = "") {
 }
 
 export default function DeviceCard({ device }) {
-  const { selectDevice } = useDevice();
+  const { selectDevice, setPairingDevice } = useDevice();
   const navigate = useNavigate();
 
   function handleClick() {
-    selectDevice(device);
-    navigate("/device");
+    const existing = loadToken(device.url);
+    if (existing) {
+      // Already have a valid token — go straight to file explorer
+      selectDevice(device, existing);
+      navigate("/device");
+    } else {
+      // Need to pair first — set the base URL so pair requests reach this device
+      setBaseURL(device.url);
+      setPairingDevice(device);
+    }
   }
 
   return (

@@ -23,6 +23,8 @@ const deviceRoute      = require('./server/routes/device');
 const filesRoute       = require('./server/routes/files');
 const streamRoute      = require('./server/routes/stream');
 const searchRoute      = require('./server/routes/search');
+const pairRoute        = require('./server/routes/pair');
+const authenticate     = require('./server/middleware/auth');
 const { startAdvertise, stopAdvertise, advertiseStatus, getLocalIP }
                        = require('./server/discovery/advertise');
 
@@ -32,23 +34,26 @@ const app = express();
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 app.use(express.json());
 
-// Routes (matching laptop server API surface)
+// ── Public routes ──────────────────────────────────────────────────────────
+app.use('/pair',    pairRoute);    // POST /pair/request, POST /pair/verify
 app.use('/device',  deviceRoute);
-app.use('/devices', deviceRoute);   // alias
-app.use('/files',   filesRoute);
-app.use('/file',    filesRoute);    // alias — GET /file/info?id=
-app.use('/stream',  streamRoute);
-app.use('/search',  searchRoute);
+app.use('/devices', deviceRoute);
 
-// Health check
+// ── Protected routes ───────────────────────────────────────────────────────
+app.use('/files',   authenticate, filesRoute);
+app.use('/file',    authenticate, filesRoute);   // alias — GET /file/info?id=
+app.use('/stream',  authenticate, streamRoute);
+app.use('/search',  authenticate, searchRoute);
+
+// Health check (public)
 app.get('/ping', (req, res) => res.json({ status: 'ok', ts: Date.now() }));
 
 // ── Start server ─────────────────────────────────────────────────────────────
@@ -162,6 +167,38 @@ rnBridge.channel.on('message', (msg) => {
             devices: [],
             error:   err.message,
           }));
+        }
+        break;
+      }
+
+      case 'GET_TRUSTED_DEVICES': {
+        const fs    = require('fs');
+        const dFile = require('path').join(__dirname, 'trusted_devices.json');
+        try {
+          const list = JSON.parse(fs.readFileSync(dFile, 'utf8'));
+          rnBridge.channel.send(JSON.stringify({
+            type:    'TRUSTED_DEVICES',
+            devices: list.map(d => ({
+              deviceName: d.deviceName,
+              pairedAt:   new Date(d.pairedAt * 1000).toISOString().slice(0, 10),
+            })),
+          }));
+        } catch {
+          rnBridge.channel.send(JSON.stringify({ type: 'TRUSTED_DEVICES', devices: [] }));
+        }
+        break;
+      }
+
+      case 'REVOKE_DEVICE': {
+        const fs    = require('fs');
+        const dFile = require('path').join(__dirname, 'trusted_devices.json');
+        try {
+          const list     = JSON.parse(fs.readFileSync(dFile, 'utf8'));
+          const filtered = list.filter(d => d.deviceName !== cmd.name);
+          fs.writeFileSync(dFile, JSON.stringify(filtered, null, 2), 'utf8');
+          rnBridge.channel.send(JSON.stringify({ type: 'DEVICE_REVOKED', name: cmd.name }));
+        } catch (err) {
+          rnBridge.channel.send(JSON.stringify({ type: 'REVOKE_ERROR', error: err.message }));
         }
         break;
       }

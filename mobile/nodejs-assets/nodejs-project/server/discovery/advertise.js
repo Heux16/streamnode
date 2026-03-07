@@ -21,10 +21,14 @@ function getLocalIP() {
 }
 
 function startAdvertise(port) {
-  if (running) {
+  if (running || service) {
     console.log('[mDNS] Already advertising');
     return;
   }
+
+  // Set running immediately — don't wait for the async 'up' event,
+  // otherwise stopAdvertise() called quickly may see running=false and bail.
+  running = true;
 
   try {
     // bonjour-service is a CJS-compatible fork safe for nodejs-mobile
@@ -43,29 +47,38 @@ function startAdvertise(port) {
     });
 
     service.on('up', () => {
-      running = true;
       console.log(`[mDNS] Service published: StreamNode-Mobile._streamnode._tcp.local`);
     });
 
     service.on('error', (err) => {
       console.error('[mDNS] Publish error:', err.message);
+      running = false;
     });
   } catch (err) {
     console.error('[mDNS] Failed to start advertising:', err.message);
+    running = false;
   }
 }
 
 function stopAdvertise() {
-  if (!running) return;
+  // Guard on running OR service/bonjourInstance in case 'up' hasn't fired yet
+  if (!running && !service && !bonjourInstance) return;
+  running = false;
   try {
-    if (service) service.stop();
-    if (bonjourInstance) bonjourInstance.destroy();
-    running = false;
-    service = null;
-    bonjourInstance = null;
+    // unpublishAll sends DNS-SD goodbye (zero-TTL) packets so LAN peers
+    // immediately remove this entry rather than waiting for TTL expiry.
+    if (bonjourInstance) {
+      bonjourInstance.unpublishAll(() => {
+        if (bonjourInstance) { bonjourInstance.destroy(); bonjourInstance = null; }
+      });
+    }
+    if (service) { service.stop(); service = null; }
     console.log('[mDNS] Advertising stopped');
   } catch (err) {
     console.error('[mDNS] Error stopping advertising:', err.message);
+    // Force-clear references even on error
+    service = null;
+    bonjourInstance = null;
   }
 }
 

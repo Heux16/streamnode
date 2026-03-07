@@ -1,23 +1,60 @@
 import express from "express";
-import cors from "cors";
-import filesRoute from "./routes/files.js";
+import cors    from "cors";
+import os      from "os";
+import filesRoute  from "./routes/files.js";
 import streamRoute from "./routes/stream.js";
 import deviceRoute from "./routes/devices.js";
+import pairRoute   from "./routes/pair.js";
+import mediaRoute  from "./routes/media.js";
+import authenticate from "./middleware/auth.js";
+import { startAdvertise } from "./discovery/advertise.js";
+
+function getLocalIP() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const iface of nets[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+    }
+  }
+  return '127.0.0.1';
+}
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  allowedHeaders: ['Range', 'Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length'],
+}));
 app.use(express.json());
 
-// primary routes
-app.use("/files", filesRoute);
-app.use("/file", filesRoute);       // alias: GET /file/info?id=
-app.use("/stream", streamRoute);
-app.use("/devices", deviceRoute);
-app.use("/device", deviceRoute);    // alias: GET /device
+// ── Public routes (no auth required) ──────────────────────────────────────────
+app.use("/pair",    pairRoute);          // POST /pair/request, POST /pair/verify
+app.use("/device",  deviceRoute);        // GET  /device
+app.use("/devices", deviceRoute);        // GET  /devices (LAN discovery)
+
+// ── Protected routes (Bearer token required) ──────────────────────────────────
+app.use("/files",  authenticate, filesRoute);
+app.use("/file",   authenticate, filesRoute);   // alias: GET /file/info?id=
+app.use("/stream", authenticate, streamRoute);
+app.use("/media",     authenticate, mediaRoute);
+app.use("/subtitles", authenticate, mediaRoute);
+app.use("/hls",       authenticate, mediaRoute);
 
 const PORT = 8000;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  const ip = getLocalIP();
+  console.log(`[server] StreamNode running on port ${PORT}`);
+  console.log(`[server] LAN IP: ${ip}`);
+  console.log(`[server] Pair a device: POST http://localhost:${PORT}/pair/request`);
+
+  // Auto-advertise on LAN so mobile devices can discover this laptop immediately
+  startAdvertise({
+    name: 'StreamNode-Laptop',
+    type: 'streamnode',
+    port: PORT,
+    txt: { ip, version: '1.0', platform: 'laptop' },
+  });
+  console.log(`[mDNS] Advertising StreamNode-Laptop on ${ip}:${PORT}`);
 });

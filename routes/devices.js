@@ -7,7 +7,7 @@ const router = express.Router();
 router.get("/", (req, res) => {
   try {
     const result = find();
-    console.log(result.devices);
+   
     res.json({ ...result, ...advertiseStatus() });
   } catch (err) {
     console.error(err);

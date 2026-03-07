@@ -1,6 +1,7 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
+import { STREAM_CHUNK_SIZE } from "../config/streamingConfig.js";
 
 const router = express.Router();
 
@@ -24,44 +25,57 @@ const MIME_TYPES = {
   ".pdf": "application/pdf",
 };
 
-// GET /stream/:filename?path=./shared/movies (path is optional, defaults to shared)
+// GET /stream/:filename?path=./shared/movies
 router.get("/:filename", (req, res) => {
   const basePath = req.query.path || "./shared";
-  const filePath = path.join(basePath, req.params.filename);
-  const ext = path.extname(filePath).toLowerCase();
+  const filePath = path.resolve(path.join(basePath, req.params.filename));
+  const ext      = path.extname(filePath).toLowerCase();
   const contentType = MIME_TYPES[ext] || "application/octet-stream";
 
+  let stat;
   try {
-    const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
-    if (!range) {
-      res.writeHead(200, {
-        "Content-Length": fileSize,
-        "Content-Type": contentType,
-        "Accept-Ranges": "bytes",
-      });
-      fs.createReadStream(filePath).pipe(res);
-      return;
-    }
-
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunkSize = end - start + 1;
-
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": chunkSize,
-      "Content-Type": contentType,
-    });
-
-    fs.createReadStream(filePath, { start, end }).pipe(res);
+    stat = fs.statSync(filePath);
   } catch {
-    res.status(404).json({ error: "File not found" });
+    return res.status(404).json({ error: "File not found" });
   }
+
+  if (stat.isDirectory()) return res.status(400).json({ error: "Path is a directory" });
+
+  const fileSize = stat.size;
+  const range    = req.headers.range;
+
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Content-Type", contentType);
+
+  if (!range) {
+    // Full file — stream with efficient 1 MB chunks
+    res.writeHead(200, { "Content-Length": fileSize });
+    fs.createReadStream(filePath, { highWaterMark: STREAM_CHUNK_SIZE }).pipe(res);
+    return;
+  }
+
+  // Parse Range: bytes=<start>-[end]
+  const parts  = range.replace(/bytes=/, "").split("-");
+  const start  = parseInt(parts[0], 10);
+  const rawEnd = parts[1];
+
+  // Default end = start + chunk size (limits memory and enables seeking)
+  const end = rawEnd
+    ? Math.min(parseInt(rawEnd, 10), fileSize - 1)
+    : Math.min(start + STREAM_CHUNK_SIZE - 1, fileSize - 1);
+
+  if (isNaN(start) || start > end || start >= fileSize) {
+    res.writeHead(416, { "Content-Range": `bytes */${fileSize}` });
+    return res.end();
+  }
+
+  const chunkSize = end - start + 1;
+  res.writeHead(206, {
+    "Content-Range":  `bytes ${start}-${end}/${fileSize}`,
+    "Content-Length": chunkSize,
+  });
+
+  fs.createReadStream(filePath, { start, end, highWaterMark: STREAM_CHUNK_SIZE }).pipe(res);
 });
 
 export default router;

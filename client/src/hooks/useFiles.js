@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { getFiles } from "../services/api.js";
+import { getFiles, clearToken, getBaseURL } from "../services/api.js";
 
 export function useFiles(folderPath) {
   const [files, setFiles] = useState([]);
@@ -15,7 +15,13 @@ export function useFiles(folderPath) {
       const data = await getFiles(folderPath);
       setFiles(data);
     } catch (err) {
-      setError("Cannot load files. Check device connection.");
+      if (err.response?.status === 401) {
+        // Token expired or server restarted — clear it so next tap triggers re-pairing
+        clearToken(getBaseURL());
+        setError("UNAUTHORIZED");
+      } else {
+        setError("Cannot load files. Check device connection.");
+      }
       setFiles([]);
     } finally {
       setLoading(false);

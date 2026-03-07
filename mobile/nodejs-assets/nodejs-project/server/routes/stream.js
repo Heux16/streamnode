@@ -9,6 +9,9 @@ const path = require('path');
 const mime = require('mime-types');
 const { SHARED_FOLDERS } = require('../config');
 
+// 1 MB chunks — efficient for mobile storage without overloading RAM
+const CHUNK_SIZE = 1024 * 1024;
+
 const router = express.Router();
 
 // Explicit MIME type map (overrides / supplements mime-types library)
@@ -25,7 +28,7 @@ function getMimeType(filePath) {
 // GET /stream/:filename?path=/storage/emulated/0/Movies
 router.get('/:filename', (req, res) => {
   const baseDir = req.query.path || SHARED_FOLDERS[0];
-  const filePath = path.join(baseDir, req.params.filename);
+  const filePath = path.resolve(path.join(baseDir, req.params.filename));
   const contentType = getMimeType(filePath);
 
   let stat;
@@ -53,16 +56,19 @@ router.get('/:filename', (req, res) => {
       'Content-Length': fileSize,
       'Content-Type': contentType,
     });
-    fs.createReadStream(filePath).pipe(res);
+    fs.createReadStream(filePath, { highWaterMark: CHUNK_SIZE }).pipe(res);
     return;
   }
 
   // Parse Range: bytes=<start>-[end]
   const [rawStart, rawEnd] = rangeHeader.replace(/bytes=/, '').split('-');
   const start = parseInt(rawStart, 10);
-  const end   = rawEnd ? parseInt(rawEnd, 10) : fileSize - 1;
+  // Default end = start + chunk size (limits memory, enables seeking)
+  const end = rawEnd
+    ? Math.min(parseInt(rawEnd, 10), fileSize - 1)
+    : Math.min(start + CHUNK_SIZE - 1, fileSize - 1);
 
-  if (isNaN(start) || start >= fileSize || end >= fileSize || start > end) {
+  if (isNaN(start) || start > end || start >= fileSize) {
     res.writeHead(416, {
       'Content-Range': `bytes */${fileSize}`,
     });
@@ -78,7 +84,7 @@ router.get('/:filename', (req, res) => {
   });
 
   // Stream only the requested chunk — no full file load
-  const stream = fs.createReadStream(filePath, { start, end });
+  const stream = fs.createReadStream(filePath, { start, end, highWaterMark: CHUNK_SIZE });
   stream.pipe(res);
 
   stream.on('error', (err) => {
