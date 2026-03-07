@@ -28,9 +28,23 @@ function extType(filename) {
   return 'file';
 }
 
-// GET /files?path=/storage/emulated/0/Movies
+// GET /files
+//   No path → return all SHARED_FOLDERS as a virtual root listing
+//   With ?path= → list that directory's contents
 router.get('/', (req, res) => {
-  const folder = req.query.path || SHARED_FOLDERS[0];
+  // Virtual root: show all configured shared folders as top-level entries
+  if (!req.query.path) {
+    const result = SHARED_FOLDERS.map((folderPath) => ({
+      name: path.basename(folderPath),
+      path: folderPath,
+      isDirectory: true,
+      type: 'folder',
+      ext: '',
+    }));
+    return res.json(result);
+  }
+
+  const folder = req.query.path;
 
   try {
     if (!fs.existsSync(folder)) {
