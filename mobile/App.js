@@ -29,16 +29,57 @@ import {
 } from 'react-native';
 import nodejs from 'nodejs-mobile-react-native';
 import Video from 'react-native-video';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// Per-session token registry  { [deviceUrl]: jwtToken }
-// Survives re-renders; cleared on app restart (acceptable for LAN use).
-const tokenStore = {};
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent token store
+// In-memory cache, backed by AsyncStorage so tokens survive app restarts.
+// Key format: sn_token_<deviceUrl>  (one AsyncStorage key per device)
+// ─────────────────────────────────────────────────────────────────────────────
+const tokenStore = {}; // runtime cache
+
+const TOKEN_KEY = (url) => `sn_token_${url}`;
+
+// Load all persisted tokens into the in-memory cache.
+// Call once on app / BrowseTab mount.
+async function hydrateTokens() {
+  try {
+    const allKeys = await AsyncStorage.getAllKeys();
+    const tokenKeys = allKeys.filter(k => k.startsWith('sn_token_'));
+    if (tokenKeys.length === 0) return;
+    const pairs = await AsyncStorage.multiGet(tokenKeys);
+    for (const [key, value] of pairs) {
+      if (value) {
+        const url = key.replace('sn_token_', '');
+        tokenStore[url] = value;
+      }
+    }
+  } catch (e) {
+    console.warn('[tokenStore] hydrate failed:', e.message);
+  }
+}
+
+// Save a token both in memory and to AsyncStorage.
+function saveToken(url, token) {
+  tokenStore[url] = token;
+  AsyncStorage.setItem(TOKEN_KEY(url), token).catch(e =>
+    console.warn('[tokenStore] save failed:', e.message)
+  );
+}
+
+// Remove a token from memory and AsyncStorage.
+function forgetToken(url) {
+  delete tokenStore[url];
+  AsyncStorage.removeItem(TOKEN_KEY(url)).catch(e =>
+    console.warn('[tokenStore] remove failed:', e.message)
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TABS = { SERVER: 'server', BROWSE: 'browse' };
+const TABS = { SERVER: 'server', BROWSE: 'browse', VIRTUAL: 'virtual' };
 
 const STATUS = {
   STARTING: 'starting',
@@ -202,7 +243,9 @@ export default function App() {
               nodejs.channel.send(JSON.stringify({ type: 'REVOKE_DEVICE', name }));
             }}
           />
-        : <BrowseTab />
+        : tab === TABS.VIRTUAL
+          ? <VirtualTab />
+          : <BrowseTab />
       }
 
       <View style={styles.tabBar}>
@@ -225,8 +268,385 @@ export default function App() {
             Browse
           </Text>
         </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.tabBtn, tab === TABS.VIRTUAL && styles.tabBtnActive]}
+          onPress={() => setTab(TABS.VIRTUAL)}
+        >
+          <Text style={styles.tabIcon}>🗄️</Text>
+          <Text style={[styles.tabLabel, tab === TABS.VIRTUAL && styles.tabLabelActive]}>
+            Virtual FS
+          </Text>
+        </TouchableOpacity>
       </View>
     </SafeAreaView>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tab 3 – Virtual FS (native React Native)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VFS_CATEGORIES  = ['Videos', 'Music', 'Photos', 'Documents', 'Other'];
+const VFS_CAT_ICONS   = { Videos: '🎥', Music: '🎵', Photos: '🖼️', Documents: '📄', Other: '📁' };
+
+function vfsFmt(bytes) {
+  if (!bytes || bytes === 0) return '';
+  if (bytes >= 1e9)  return (bytes / 1e9).toFixed(1)  + ' GB';
+  if (bytes >= 1e6)  return (bytes / 1e6).toFixed(1)  + ' MB';
+  return Math.round(bytes / 1e3) + ' KB';
+}
+
+/** Find the laptop base URL from tokenStore (port 8000). */
+function getLaptopUrl() {
+  return Object.keys(tokenStore).find(k => k.includes(':8000')) || null;
+}
+
+/** Build X-Device-Tokens header value. */
+function buildDeviceTokensHeader() {
+  const out = {};
+  for (const [url, token] of Object.entries(tokenStore)) {
+    if (token) out[url] = token;
+  }
+  return JSON.stringify(out);
+}
+
+/** Fetch virtual FS data from laptop server. */
+async function vfsFetch(laptopUrl, path, opts = {}) {
+  const token = tokenStore[laptopUrl];
+  const headers = {
+    ...(token ? { Authorization: 'Bearer ' + token } : {}),
+    'X-Device-Tokens': buildDeviceTokensHeader(),
+    ...opts.headers,
+  };
+  const res = await fetch(laptopUrl + path, { signal: opts.signal, headers });
+  if (res.status === 401) throw new Error('UNAUTHORIZED');
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+function VirtualTab() {
+  const [laptopUrl,      setLaptopUrl]      = useState(null);
+  const [loading,        setLoading]        = useState(true);
+  const [refreshing,     setRefreshing]     = useState(false);
+  const [error,          setError]          = useState(null);
+  const [virtualData,    setVirtualData]    = useState(null);  // { categories, total }
+  const [storageReport,  setStorageReport]  = useState(null);
+  const [activeCategory, setActiveCategory] = useState('Videos');
+  const [search,         setSearch]         = useState('');
+  const [searchResults,  setSearchResults]  = useState(null);  // null = inactive
+  const [searchLoading,  setSearchLoading]  = useState(false);
+  const [mediaScreen,    setMediaScreen]    = useState(null);  // {type,file,url}
+  const [pairingDevice,  setPairingDevice]  = useState(null);
+  const searchTimer = useRef(null);
+
+  // Load on mount
+  useEffect(() => {
+    (async () => {
+      await hydrateTokens();
+      const url = getLaptopUrl();
+      setLaptopUrl(url);
+      if (!url) { setLoading(false); return; }
+      await loadData(url, true);
+    })();
+  }, []);
+
+  // Debounced search
+  useEffect(() => {
+    clearTimeout(searchTimer.current);
+    if (!search.trim()) { setSearchResults(null); return; }
+    searchTimer.current = setTimeout(async () => {
+      const url = getLaptopUrl();
+      if (!url) return;
+      setSearchLoading(true);
+      try {
+        const results = await vfsFetch(url, '/search?q=' + encodeURIComponent(search.trim()));
+        setSearchResults(results);
+      } catch { /* ignore */ } finally {
+        setSearchLoading(false);
+      }
+    }, 400);
+    return () => clearTimeout(searchTimer.current);
+  }, [search]);
+
+  // Hardware back
+  useEffect(() => {
+    const handler = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (mediaScreen)   { setMediaScreen(null); return true; }
+      if (pairingDevice) { setPairingDevice(null); return true; }
+      if (search)        { setSearch(''); setSearchResults(null); return true; }
+      return false;
+    });
+    return () => handler.remove();
+  }, [mediaScreen, pairingDevice, search]);
+
+  async function loadData(url, bustCache = false) {
+    setLoading(true);
+    setError(null);
+    try {
+      if (bustCache) {
+        await fetch(url + '/virtual-files/refresh', {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer ' + tokenStore[url],
+            'X-Device-Tokens': buildDeviceTokensHeader(),
+          },
+        }).catch(() => {});
+      }
+      const [vf, sr] = await Promise.all([
+        vfsFetch(url, '/virtual-files'),
+        vfsFetch(url, '/storage').catch(() => null),
+      ]);
+      setVirtualData(vf);
+      setStorageReport(sr);
+    } catch (e) {
+      setError(e.message || 'Failed to load');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleRefresh() {
+    const url = getLaptopUrl();
+    if (!url) return;
+    setRefreshing(true);
+    setSearch('');
+    setSearchResults(null);
+    try {
+      await loadData(url, true);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  function buildVfsStreamUrl(file) {
+    const token = tokenStore[file.deviceUrl];
+    const folderPath = file.path
+      ? file.path.substring(0, file.path.lastIndexOf('/'))
+      : null;
+    return buildStreamUrl(
+      { url: file.deviceUrl },
+      file,
+      folderPath,
+      token,
+    );
+  }
+
+  function openFile(file) {
+    const token = tokenStore[file.deviceUrl];
+    if (!token) {
+      setPairingDevice({ url: file.deviceUrl, name: file.deviceName, host: file.deviceUrl, port: '' });
+      return;
+    }
+    const url = buildVfsStreamUrl(file);
+    if (file.type === 'video') {
+      setMediaScreen({ type: 'video', file, url });
+    } else if (file.type === 'audio') {
+      setMediaScreen({ type: 'audio', file, url });
+    } else if (file.type === 'image') {
+      setMediaScreen({ type: 'image', file, url });
+    } else {
+      Linking.openURL(url).catch(() =>
+        Alert.alert('No app found', 'No app is registered to open this file type.'),
+      );
+    }
+  }
+
+  if (mediaScreen) {
+    if (mediaScreen.type === 'video')
+      return <VideoPlayerScreen url={mediaScreen.url} name={mediaScreen.file.name} onClose={() => setMediaScreen(null)} />;
+    if (mediaScreen.type === 'audio')
+      return <AudioPlayerScreen url={mediaScreen.url} name={mediaScreen.file.name} onClose={() => setMediaScreen(null)} />;
+    if (mediaScreen.type === 'image')
+      return <ImageViewerScreen url={mediaScreen.url} name={mediaScreen.file.name} onClose={() => setMediaScreen(null)} />;
+  }
+
+  if (pairingDevice) {
+    return (
+      <PairingScreen
+        device={pairingDevice}
+        onCancel={() => setPairingDevice(null)}
+        onPaired={(dev, token) => {
+          saveToken(dev.url, token);
+          setPairingDevice(null);
+        }}
+      />
+    );
+  }
+
+  // ── Not paired with laptop yet ──────────────────────────────────────────────
+  if (!laptopUrl) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0f172a', padding: 32 }}>
+        <Text style={{ fontSize: 44, marginBottom: 16 }}>🖥️</Text>
+        <Text style={{ color: '#f1f5f9', fontSize: 18, fontWeight: '700', marginBottom: 8, textAlign: 'center' }}>
+          Laptop not paired
+        </Text>
+        <Text style={{ color: '#94a3b8', fontSize: 14, textAlign: 'center' }}>
+          Go to the Browse tab, discover your laptop and pair with it first.
+        </Text>
+      </View>
+    );
+  }
+
+  const displayFiles = searchResults !== null
+    ? searchResults
+    : (virtualData?.categories?.[activeCategory] ?? []);
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+  return (
+    <View style={styles.flex}>
+      {/* Header */}
+      <View style={styles.fileBrowserHeader}>
+        <Text style={[styles.deviceNameSmall, { flex: 1, fontSize: 16, fontWeight: '700' }]}>
+          🗄️  Virtual Filesystem
+        </Text>
+        <TouchableOpacity onPress={handleRefresh} disabled={loading || refreshing} style={{ paddingHorizontal: 10 }}>
+          <Text style={{ color: refreshing ? '#475569' : '#38bdf8', fontSize: 18 }}>↻</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Search bar */}
+      <View style={styles.searchBar}>
+        <Text style={styles.searchIcon}>🔍</Text>
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search all devices…"
+          placeholderTextColor="#475569"
+          value={search}
+          onChangeText={setSearch}
+        />
+        {search.length > 0 && (
+          <TouchableOpacity onPress={() => { setSearch(''); setSearchResults(null); }}>
+            <Text style={styles.clearBtn}>✕</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {/* Category tabs — hidden during active search */}
+      {searchResults === null && !loading && (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}
+          style={{ flexGrow: 0 }}
+          contentContainerStyle={{ paddingHorizontal: 10, paddingVertical: 5, gap: 6, flexDirection: 'row', alignItems: 'center' }}
+        >
+          {VFS_CATEGORIES.map(cat => {
+            const count = virtualData?.categories?.[cat]?.length ?? 0;
+            const active = activeCategory === cat;
+            return (
+              <TouchableOpacity
+                key={cat}
+                onPress={() => setActiveCategory(cat)}
+                style={{
+                  flexDirection: 'row', alignItems: 'center', gap: 4,
+                  paddingHorizontal: 10, paddingVertical: 4,
+                  borderRadius: 999, borderWidth: 1,
+                  alignSelf: 'center',
+                  backgroundColor: active ? '#4f46e51a' : '#1e293b',
+                  borderColor:     active ? '#6366f1'   : '#334155',
+                }}
+              >
+                <Text style={{ fontSize: 11 }}>{VFS_CAT_ICONS[cat]}</Text>
+                <Text style={{ color: active ? '#a5b4fc' : '#94a3b8', fontSize: 12, fontWeight: active ? '700' : '400' }}>{cat}</Text>
+                <Text style={{ color: '#475569', fontSize: 10 }}>({count})</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+      )}
+
+      {/* Search status pill */}
+      {searchResults !== null && (
+        <View style={{ paddingHorizontal: 16, paddingBottom: 6 }}>
+          {searchLoading
+            ? <ActivityIndicator size="small" color="#38bdf8" />
+            : <Text style={{ color: '#94a3b8', fontSize: 12 }}>
+                Found <Text style={{ color: '#f1f5f9', fontWeight: '700' }}>{searchResults.length}</Text> result{searchResults.length !== 1 ? 's' : ''}
+              </Text>
+          }
+        </View>
+      )}
+
+      {/* Loading / error / file list */}
+      {loading ? (
+        <View style={styles.emptyState}>
+          <ActivityIndicator size="large" color="#a78bfa" />
+          <Text style={[styles.emptyDesc, { marginTop: 12 }]}>Loading…</Text>
+        </View>
+      ) : error ? (
+        <View style={[styles.emptyState, { padding: 32 }]}>
+          <Text style={{ fontSize: 40, marginBottom: 12 }}>⚠️</Text>
+          <Text style={styles.errorText}>{error}</Text>
+          <TouchableOpacity style={[styles.btn, styles.btnOn, { marginTop: 20 }]}
+            onPress={() => loadData(laptopUrl, true)}>
+            <Text style={styles.btnText}>Retry</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <FlatList
+          data={displayFiles}
+          keyExtractor={f => f.id || f.path || f.name}
+          contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 24 }}
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyIcon}>{searchResults !== null ? '🔍' : VFS_CAT_ICONS[activeCategory]}</Text>
+              <Text style={styles.emptyDesc}>
+                {searchResults !== null
+                  ? 'No results for "' + search + '"'
+                  : 'No ' + activeCategory.toLowerCase() + ' found'
+                }
+              </Text>
+            </View>
+          }
+          ListFooterComponent={
+            storageReport ? (
+              <View style={{ marginTop: 16, backgroundColor: '#1e293b', borderRadius: 16, padding: 14 }}>
+                <Text style={{ color: '#94a3b8', fontSize: 13, fontWeight: '600', marginBottom: 10 }}>💾  Storage Overview</Text>
+                {storageReport.devices.map((d, i) => (
+                  <View key={i} style={{ marginBottom: 10 }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <Text style={{ color: '#cbd5e1', fontSize: 12 }} numberOfLines={1}>{d.name}</Text>
+                      <Text style={{ color: '#64748b', fontSize: 11 }}>{d.usedFmt} / {d.totalFmt} ({d.pctUsed}%)</Text>
+                    </View>
+                    <View style={{ height: 4, backgroundColor: '#0f172a', borderRadius: 4, overflow: 'hidden' }}>
+                      <View style={{
+                        height: 4, borderRadius: 4,
+                        width: Math.min(d.pctUsed, 100) + '%',
+                        backgroundColor: d.pctUsed > 90 ? '#ef4444' : d.pctUsed > 75 ? '#f59e0b' : '#6366f1',
+                      }} />
+                    </View>
+                  </View>
+                ))}
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingTop: 8, borderTopWidth: 1, borderTopColor: '#334155' }}>
+                  <Text style={{ color: '#475569', fontSize: 11 }}>Total: {storageReport.totalCapacityFmt}</Text>
+                  <Text style={{ color: '#475569', fontSize: 11 }}>Used: {storageReport.totalUsedFmt}</Text>
+                  <Text style={{ color: '#475569', fontSize: 11 }}>Free: {storageReport.totalFreeFmt}</Text>
+                </View>
+              </View>
+            ) : null
+          }
+          renderItem={({ item: file }) => (
+            <TouchableOpacity style={styles.fileRow} onPress={() => openFile(file)}>
+              <Text style={styles.fileIcon}>
+                {file.type === 'video' ? '🎥' :
+                 file.type === 'audio' ? '🎵' :
+                 file.type === 'image' ? '🖼️' :
+                 file.type === 'pdf'   ? '📕' :
+                 file.type === 'text'  ? '📝' : '📆'}
+              </Text>
+              <View style={styles.flex}>
+                <Text style={styles.fileName} numberOfLines={1}>{file.name}</Text>
+                <Text style={styles.fileMeta} numberOfLines={1}>{file.deviceName}</Text>
+              </View>
+              <View style={{ alignItems: 'flex-end' }}>
+                {file.size > 0 && <Text style={{ color: '#475569', fontSize: 11 }}>{vfsFmt(file.size)}</Text>}
+                {(file.type === 'video' || file.type === 'audio') &&
+                  <Text style={styles.playIcon}>▶</Text>}
+              </View>
+            </TouchableOpacity>
+          )}
+        />
+      )}
+    </View>
   );
 }
 
@@ -355,6 +775,14 @@ function BrowseTab() {
   const [mediaScreen, setMediaScreen]       = useState(null); // {type,file,url}
   const [pairingDevice, setPairingDevice]   = useState(null); // device awaiting pairing
 
+  // Hydrate persisted tokens once on mount so previously paired devices
+  // connect automatically without re-entering a pairing code.
+  useEffect(() => {
+    hydrateTokens();
+    // Auto-scan as soon as the tab mounts
+    scan();
+  }, []);
+
   // Listen for SCAN_RESULT from Node.js
   useEffect(() => {
     const listener = nodejs.channel.addListener('message', (msg) => {
@@ -408,7 +836,7 @@ function BrowseTab() {
       setPathStack([{ path: null, files }]);
     } catch (e) {
       if (e.message === 'UNAUTHORIZED') {
-        delete tokenStore[device.url];
+        forgetToken(device.url);
         setSelectedDevice(null);
         setPairingDevice(device);
       } else {
@@ -429,7 +857,7 @@ function BrowseTab() {
       setPathStack(s => [...s, { path: folderPath, files }]);
     } catch (e) {
       if (e.message === 'UNAUTHORIZED') {
-        delete tokenStore[selectedDevice.url];
+        forgetToken(selectedDevice.url);
         setSelectedDevice(null);
         setPathStack([]);
         setPairingDevice(selectedDevice);
@@ -497,7 +925,7 @@ function BrowseTab() {
         device={pairingDevice}
         onCancel={() => setPairingDevice(null)}
         onPaired={(dev, token) => {
-          tokenStore[dev.url] = token;
+          saveToken(dev.url, token);
           setPairingDevice(null);
           openDevice(dev, token);
         }}
@@ -1165,7 +1593,7 @@ const C = {
 };
 
 const styles = StyleSheet.create({
-  root:  { flex: 1, backgroundColor: C.bg },
+  root:  { flex: 1, backgroundColor: C.bg, paddingTop: StatusBar.currentHeight ?? 0 },
   flex:  { flex: 1 },
 
   // Tab bar

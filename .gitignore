@@ -49,6 +49,7 @@ web_modules/
 
 .server_secret
 
+trusted_devices.json
 # Optional npm cache directory
 .npm
 

@@ -25,5 +25,5 @@ export function useDevices() {
     return stop;
   }, [refresh]);
 
-  return { devices, advertising, loading, error, refresh };
+  return { devices, advertising, setAdvertising, loading, error, refresh };
 }

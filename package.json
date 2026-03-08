@@ -6,7 +6,9 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "build-frontend": "cd client && npm run build",
+    "deploy-frontend": "cd client && npm run build && systemctl --user restart streamnode-frontend"
   },
   "keywords": [],
   "author": "",

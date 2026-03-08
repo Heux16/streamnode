@@ -7,4 +7,8 @@ export default defineConfig({
     host: "0.0.0.0", // bind address, not port
     port: 5173,       // this is the actual port
   },
+  preview: {
+    host: "0.0.0.0",
+    port: 5173,
+  },
 });

@@ -31,6 +31,34 @@ export function getBaseURL() {
   return client.defaults.baseURL;
 }
 
+/**
+ * Find the laptop base URL by scanning localStorage for a token stored
+ * at port 8000.  This handles the case where the device was paired via its
+ * LAN IP (e.g. http://192.168.1.105:8000) but the browser is visiting
+ * via localhost, meaning DEFAULT_BASE_URL ≠ the token's stored key.
+ */
+export function getLaptopBaseURL() {
+  // Prefer a key that matches window.location.hostname exactly
+  if (loadToken(DEFAULT_BASE_URL)) return DEFAULT_BASE_URL;
+  // Fall back to any stored token whose URL is port 8000
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith('sn_token_')) {
+      const url = k.slice('sn_token_'.length);
+      try {
+        const u = new URL(url);
+        if (u.port === '8000' || (u.port === '' && u.protocol === 'http:')) return url;
+      } catch { /* ignore malformed */ }
+    }
+  }
+  return DEFAULT_BASE_URL;
+}
+
+/** Reset client to the local laptop server (always port 8000). */
+export function resetToLaptop() {
+  client = makeClient(getLaptopBaseURL());
+}
+
 // GET /device
 export async function getDeviceInfo() {
   const { data } = await client.get("/device");
@@ -138,3 +166,68 @@ export async function verifyPairingCode(pairingCode, deviceName) {
   const { data } = await client.post("/pair/verify", { pairingCode, deviceName });
   return data;
 }
+
+// ── Virtual Filesystem ────────────────────────────────────────────────────────
+
+/**
+ * Collect all device tokens from localStorage (all sn_token_* keys) and
+ * return them as a JSON object keyed by device URL.
+ * Sent to the laptop server so it can authenticate with remote devices
+ * on the browser's behalf (since those tokens are only in the browser).
+ */
+function collectDeviceTokens() {
+  const map = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith('sn_token_')) {
+      const url = k.slice('sn_token_'.length);
+      const tok = localStorage.getItem(k);
+      if (tok) map[url] = tok;
+    }
+  }
+  return map;
+}
+
+// GET /virtual-files → { categories: {Videos,Music,Photos,Documents,Other}, total }
+export async function getVirtualFiles() {
+  const { data } = await client.get('/virtual-files', {
+    headers: { 'X-Device-Tokens': JSON.stringify(collectDeviceTokens()) },
+  });
+  return data;
+}
+
+// POST /virtual-files/refresh — busts the 60-second server-side cache
+export async function refreshVirtualIndex() {
+  await client.post('/virtual-files/refresh', null, {
+    headers: { 'X-Device-Tokens': JSON.stringify(collectDeviceTokens()) },
+  });
+}
+
+// GET /search?q=<term> → array of file entries across all devices
+export async function searchGlobal(q) {
+  const { data } = await client.get('/search', {
+    params: { q },
+    headers: { 'X-Device-Tokens': JSON.stringify(collectDeviceTokens()) },
+  });
+  return data;
+}
+
+// GET /storage → { devices[], totalCapacity, totalUsed, totalFree, pctUsed, *Fmt }
+export async function getStorageReport() {
+  const { data } = await client.get('/storage', {
+    headers: { 'X-Device-Tokens': JSON.stringify(collectDeviceTokens()) },
+  });
+  return data;
+}
+
+// Build a stream URL for a file entry from getVirtualFiles/searchGlobal.
+// Uses the token stored for the file's device URL.
+export function streamFileEntry(fileEntry) {
+  const { deviceUrl, path: filePath, name } = fileEntry;
+  const dir = filePath.substring(0, filePath.lastIndexOf('/'));
+  const p = new URLSearchParams({ path: dir });
+  const token = loadToken(deviceUrl);
+  if (token) p.set('token', token);
+  return `${deviceUrl}/stream/${encodeURIComponent(name)}?${p}`;
+}
+

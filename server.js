@@ -1,11 +1,13 @@
 import express from "express";
 import cors    from "cors";
 import os      from "os";
-import filesRoute  from "./routes/files.js";
-import streamRoute from "./routes/stream.js";
-import deviceRoute from "./routes/devices.js";
-import pairRoute   from "./routes/pair.js";
-import mediaRoute  from "./routes/media.js";
+import filesRoute   from "./routes/files.js";
+import streamRoute  from "./routes/stream.js";
+import deviceRoute  from "./routes/devices.js";
+import pairRoute    from "./routes/pair.js";
+import mediaRoute   from "./routes/media.js";
+import indexRoute   from "./routes/index.js";
+import virtualRoute from "./routes/virtual.js";
 import authenticate from "./middleware/auth.js";
 import { startAdvertise } from "./discovery/advertise.js";
 
@@ -23,7 +25,7 @@ const app = express();
 
 app.use(cors({
   origin: '*',
-  allowedHeaders: ['Range', 'Content-Type', 'Authorization'],
+  allowedHeaders: ['Range', 'Content-Type', 'Authorization', 'X-Device-Tokens'],
   exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length'],
 }));
 app.use(express.json());
@@ -32,6 +34,7 @@ app.use(express.json());
 app.use("/pair",    pairRoute);          // POST /pair/request, POST /pair/verify
 app.use("/device",  deviceRoute);        // GET  /device
 app.use("/devices", deviceRoute);        // GET  /devices (LAN discovery)
+app.use("/index",   indexRoute);         // GET  /index  – flat file list for aggregation
 
 // ── Protected routes (Bearer token required) ──────────────────────────────────
 app.use("/files",  authenticate, filesRoute);
@@ -40,6 +43,8 @@ app.use("/stream", authenticate, streamRoute);
 app.use("/media",     authenticate, mediaRoute);
 app.use("/subtitles", authenticate, mediaRoute);
 app.use("/hls",       authenticate, mediaRoute);
+// Virtual filesystem aggregation
+app.use("/", authenticate, virtualRoute);        // /virtual-files, /search, /storage
 
 const PORT = 8000;
 

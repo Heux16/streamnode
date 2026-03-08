@@ -24,6 +24,8 @@ const filesRoute       = require('./server/routes/files');
 const streamRoute      = require('./server/routes/stream');
 const searchRoute      = require('./server/routes/search');
 const pairRoute        = require('./server/routes/pair');
+const indexRoute       = require('./server/routes/index');
+const storageRoute     = require('./server/routes/storage');
 const authenticate     = require('./server/middleware/auth');
 const { startAdvertise, stopAdvertise, advertiseStatus, getLocalIP }
                        = require('./server/discovery/advertise');
@@ -46,6 +48,8 @@ app.use(express.json());
 app.use('/pair',    pairRoute);    // POST /pair/request, POST /pair/verify
 app.use('/device',  deviceRoute);
 app.use('/devices', deviceRoute);
+app.use('/index',   authenticate, indexRoute);   // GET  /index   — flat file list (auth required)
+app.use('/storage', authenticate, storageRoute); // GET  /storage — disk usage (auth required)
 
 // ── Protected routes ───────────────────────────────────────────────────────
 app.use('/files',   authenticate, filesRoute);
