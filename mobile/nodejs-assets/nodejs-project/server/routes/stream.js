@@ -63,10 +63,12 @@ router.get('/:filename', (req, res) => {
   // Parse Range: bytes=<start>-[end]
   const [rawStart, rawEnd] = rangeHeader.replace(/bytes=/, '').split('-');
   const start = parseInt(rawStart, 10);
-  // Default end = start + chunk size (limits memory, enables seeking)
+  // If no end byte is specified, stream to end of file.
+  // DO NOT cap to CHUNK_SIZE here — the moov atom in MP4s can be anywhere
+  // in the file and capping causes the browser to miss audio codec metadata.
   const end = rawEnd
     ? Math.min(parseInt(rawEnd, 10), fileSize - 1)
-    : Math.min(start + CHUNK_SIZE - 1, fileSize - 1);
+    : fileSize - 1;
 
   if (isNaN(start) || start > end || start >= fileSize) {
     res.writeHead(416, {
